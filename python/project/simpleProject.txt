@@ -1,4 +1,11 @@
-1 envoy 是一个简单python项目，作者是kennethreitz;这个项目是对subprocesses的重写；由于代码比较简单，适合python学习
+pip-pop:
+
+1 pip-pop是一个单文件python项目， 作者是kennethreitz;工程路径：https://github.com/kennethreitz/pip-pop.git
+
+----------------------------------------------------------------------------------------------------------
+envoy:
+
+1 envoy 是一个单文件python项目，作者是kennethreitz;这个项目是对subprocesses的重写；由于代码比较简单，适合python学习
     工程路径：https://github.com/kennethreitz/envoy
 
 2 envoy中主要应用到两个标准库：subprocesses和thread
@@ -8,4 +15,20 @@
         run函数会启动一个线程，运行subprocess执行命令，并支持timeout和kill_timeout;
         connected 没有启动线程
 
+可以学习的知识点：
+    1 python unit-test 测试脚本
+    2 setup脚本文件
+    3 代码架构：把统一的逻辑封装成类，并以函数接口的形式对外展示：比如run： Command, connect: ConnectedCommand
+    4 python标准库：
+        4.1 subprocess
+            Popen, communicate, process.kill, process.pid,  process.stdin.write, process.wait
 
+        4.2 thread [Threading.Tread]
+            thread.start, thread.join， thread.is_alive()/isAlive()
+
+        4.3 os
+            os.kill(process.pid, signal.SIGTERM)
+            os.kill(process.pid, signal.SIGKILL)            
+
+        4.4 Traceback模块：用于打印python程序的代码栈信息
+            traceback.format_exc()
