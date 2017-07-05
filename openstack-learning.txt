@@ -1,0 +1,502 @@
+
+keystone模块:
+
+    User:   keystone user-list
+            User指代任何时用OpenStack的实体，可以是真正的用户，其他系统或者服务
+
+    Credentials: 
+            Credentials是User用来证明自己身份的信息，可以是：1 用户名/密码 2 Token 3 API Key 4 其他高级方式
+
+    Authentication:
+            Authentication是Keystone验证User身份的过程。User访问OpenStack时向Keystone提交用户名和密码形式的Credentials,
+            Keystone验证通过后会给User签发一个Token作为后续访问的Credential
+
+    Token:
+            Token是有数字和字母组成的字符串，User成功Authentication后由Keystone分配给User.
+            1 Token用做访问Service的Credential
+            2 Service 会通过Keystone验证Token的有效性
+            3 Token的有效期默认是24小时
+
+    Project：  openstack project list / keystone tenant-list
+            用于将OpenStack的资源进行分组和隔离。
+            1 资源的所有权是属于Project的，而不是User
+            2 在OpenStack的界面和文档中，Tenant/Project/Account这几个术语是通用的，更倾向Project
+            3 每个User必须挂载Project里才能访问该Project的资源。一个User可以属于多个Project
+            4 admin相当与root用户，具有最高权限
+
+    Service:   keystone service-list 
+            Openstack的Service包括 Compute(Nova), Block Storage (Cinder), Object Storage (Swift), Image Service (Glance)
+                    Networking Service (Neutron)等。每个Service都会提供若干个Endpoint，User通过Endpoint访问资源和执行操作
+    
+    Endpoint:
+            Endpoint是一个网络上可访问的地址，通常是一个URL。Service通过Endpoint暴露自己的API。Keystone负责管理和维护每个Service的
+            Endpoint。
+    
+            openstack endpoint list / keystone endpoint-list / keystone endpoint-get --service [compute|network|volume]
+            openstack catalog list  / keystone catalog
+
+    Role:
+            安全包含两部分：Authentication(认证) 和 Authorization(鉴权) Authentication解决的是"你是谁?"的问题，Authorization解决
+            的是"你能干什么?"的问题。Keystone是借助Role来实现Authorization的:
+                1 Keystone定义Role
+                2 可以为User分配一个或多个Role Horizon
+                3 Service决定每个Role能做什么事情 Service通过各自的policy.json文件对Role进行访问控制 
+                    例如:Nova服务的文件为 /etc/nova/policy.json
+                    OpenStack默认配置只区分admin和非admin Role。如果需要对特定的Role进行授权，可以修改policy.json
+        
+            openstack role list / keystone role-list
+
+   举例：用户查询Image的流程
+        1 首先user将请求发送到Glance的Endpoint
+        2 Glance向Keystone询问admin身份的有效性
+        3 Keystone确认用户身份有效性(哪个project的)
+        4 Glance会查看/etc/glance/policy.json,判断admin是否有查看image的权限
+        5 确认后，调用对应的方法，把返回信息返还给用户
+
+--------------------------------------------------------------------------------------------------------
+glance模块：
+    Image是一个模板，里面包含了基本的操作系统和其他的软件
+    OpenStack流程：
+        1 先手工安装好虚拟机，里面包含需要的软件
+        2 对虚拟机执行snapshot, 这样就得到了一个image
+        3 安装其他虚拟机时，使用这个image
+
+    Glance的功能： 
+        1 提供REST API让用户能够查询和获取image的元数据和image本身
+        2 支持多种方式存储image,包括普通的文件系统、Swift、Amazon S3等
+        3 对Instance执行Snapshot创建新的image
+
+    架构：
+        
+        glance-api      --> glance-registry  <--------> DB
+                
+                        --> store backend    <--------> Swift
+                                                        S3
+                                                        Filesystem
+                                                        HTTP
+
+
+        glance-api:是系统后台运行的服务进程，对外提供REST API，响应image查询、获取和存储的调用。
+                   glance-api不会真正处理请求；如果是与image metadata相关的操作，将请求转发给glance-registry
+                   如果是与image本身存取相关的操作，将请求转发给该image的store backend
+
+        glance-registry：是系统后台的服务进程。负责处理和存取image的metadata;
+
+        Store backend: Glance自己并不存储image,真正的image是存放在backend中。Glance支持多种多种backend,包括：
+                1 本地文件系统目录 2 GridFS 3 Ceph RBD 4 S3 5 Sheepdog 6 Cinder 7 Swift 8 VMware ESX
+                具体使用哪种backend，是在/etc/glance/glance-api.conf中配置的[glance_store]                        
+        
+    页面上的信息：如果勾选public,该image可以被其他的Project使用；如果勾选Protected,该image不允许被删除
+
+------------------------------------------------------------------------------------------------------------------
+nova服务：
+    相关组件：
+        API：
+            nova-api:接收和响应客户的API调用
+
+        Compute Core:
+            nova-scheduler: 虚拟调度服务，负责决定在哪个计算节点上运行虚机
+            nova-compute: 管理虚拟机的核心服务，通过调用Hypervisor API实现虚拟机生命周期管理
+            Hypervisor: 计算节点上跑的虚拟化程序；qemu-kvm, xen, vmware
+            nova-conductor: 用于更新数据库，比如更新虚拟机状态
+
+        Console Interface:
+            nova-console: 用户可以通过多种方式访问虚拟机的控制台
+                nova-novncproxy: 基于web浏览器的VNC访问
+                nova-spicehtml5proxy: 基于HTML5浏览器的SPICE访问
+                nova-xvpnvncproxy: 基于java客户端的VNC访问
+            nova-consoleauth: 负责对访问虚拟机控制台请求提供Token认证
+            nova-cert: 提供x509证书支持
+        
+        Message Queue:
+            nova通过Message queue作为子服务的信息中转站。
+
+    查看服务所在节点: nova host-list / nova service-list / openstack compute service-list
+    查看flavor:     nova flavor-list / openstack flavor list
+    查看节点:        openstack hypervisor list
+    查看虚拟机:      nova list / openstack server list 
+    查看某个节点上的虚拟机:  nova hypervisor-servers {node-hostname} 
+                   
+
+    nova-compute创建instance的过程可以分为4步：
+        1 为instance准备资源
+        2 创建instance的镜像文件
+            1 首先将该image下载到计算节点
+                1 image如果是qcow2格式额，下载完成后，通过qemu-img转换程raw格式的。转换的原因是下一步需要将其作为instance
+                    的镜像文件的backing file, 而backing file不能是qcow2格式
+                2 image存放由/etc/nova/nova.conf中instance_path, base_dir_name决定
+                    /var/lib/nova/instances/_base/
+            2 然后将其作为backing file创建instance的镜像文件
+                instance的镜像文件直接通过qemu-img命令创建，backing file就是下载的image。instance的镜像文件位于
+                    /var/lib/nova/instances/{uuid}/disk
+
+            注意点：
+                1 image 指的是Glance上保存的镜像，作为instance运行的模板
+                2 镜像文件，指的是instance启动盘所对应的文件
+                3 二者的关系是:image是镜像文件的backing file。image不会变，而镜像文件会发生变化。
+        3 创建instance的XML定义文件
+                创建的XML文件会保存到该instance目录 /var/lib/nova/instances/{uuid}/libvirt.xml
+        4 创建虚拟网络并启动虚拟机
+                1 instance创建虚拟网络设备VIF
+                2 启动instance
+
+    Launch Instance: 创建虚拟机机
+    Start Instance： 虚拟机开机
+    Shut Off Instance: 虚拟机关机
+
+    Soft Reboot Instance: 重启虚拟机(操作系统)
+    Hard Reboot Instance: 关机重启
+
+    Lock Instance: 锁定虚拟机 Unlock Instance: 解锁虚拟机
+        1 admin角色的用户不受lock的影响，及无论加锁与否都可以正常执行操作
+        2 根据默认policy的配置，任何用户都可以unlock。
+
+    Terminate Instance：删除instance
+
+    Pause Instance: 暂停虚拟机，并将虚拟机状态保存到宿主机的内存中 Resume Instance: 从内存中读回instance状态
+    Suspend Instance: 暂停虚拟机，并将虚拟机的状态保存到宿主机的磁盘上  Resume Instance: 从硬盘读回instance的状态
+        两者的相同点和不同点：
+            相同点： 都是暂停instance的运行，保存状态，之后可以通过Resume操作恢复
+            不同点：
+                1 Suspend 将instance的状态保存在磁盘上；Pause是保存在内存中，所以Resume被Pause的instance要比Suspend快
+                2 Suspend之后的instance，其状态是Shut Down;而被Pause的instance状态是Paused
+                3 虽然都是通过Resume操作恢复，Pause对应的是Resume在Openstack内部被叫做"Unpause";Suspend对应的Resume才是真正
+                    的Resume。这个在日志中能体现出来
+    
+    rescue/unrescue: 只能用命令行操作
+        Rescue操作为虚拟机备份出一个系统镜像
+        Unrescue操作从原启动盘引导instance
+
+    Snapshot:
+        对instance的镜像文件(系统盘)进行全量备份，生成一个类型为snapshot的image,然后将其保存到Glance上
+    Rebuild Instance:    
+        Rebuild会用snapshot替换instance当前的镜像文件，同时保持instance的其他资源属性不变
+
+    Shelve Instance: (将虚拟机转换成镜像文件)
+         Shelve 会将instance作为image保存到Glance中，然后在宿主机上删除该instance。
+    Unshelve Instance:
+        通过指定的image launch一个新的instance出来，流程与lanch大体相同
+
+    Migrate：虚拟机迁移(不要求共享存储，但计算节点间需要配置nova用户无密码访问)
+        底层使用resize操作实现，只是在scheduler流程中，目标节点不能与源节点相同
+        instance的镜像文件是通过scp传到目标节点上的
+    Resize: 在Migrate的同时，应用新的flavor
+
+    Live Migrate: 在线迁移
+        1 源和目的节点没有共享存储，instance在迁移的时候需要将其镜像文件从源节点传到目标节点，Block Migration
+        2 源和目的节点共享存储，instance的镜像文件不需要迁移，只需要将instance的状态迁移到目标节点。
+        
+        在线迁移的条件：    
+            1 源和目的节点的CPU类型一致
+            2 源和目的节点的libvirt版本一致
+            3 源和目的节点能互相识别对方主机名称
+            4 源和目的节点/etc/nova/nova.conf中指明在线迁移时使用TCP协议
+            5 Instance使用config driver保存其metadata。在Block Migration过程中，该config driver也需要迁移到目标节点。
+            6 源和目标节点的libvirt TCP远程监听服务得打开
+------------------------------------------------------------------------------------------------------------
+cinder 服务：
+    
+    操作系统提供存储空间的方式：
+        1 通过某种协议(SAS, SCSI, SAN, ISCSI等)挂接裸硬盘，然后分区，格式化、创建文件系统；或者直接使用裸硬盘存储数据(数据库)    [块存储]
+        2 通过NFS、CIFS等协议，mount远程的文件系统    [文件系统存储]
+
+    cinder的功能：
+        1 提供REST API使用户能够查询和管理volume、volume snapshot以及volume type
+        2 提供scheduler调度volume创建请求，合理优化存储资源的分配
+        3 通过driver架构支持多种backend（后端）存储方式，包括LVM, NFS, Ceph和其他存储厂商产品
+
+    架构:
+        cinder-api ----> cinder-volume ---> volume provider
+                                       ---> cinder database
+                                       ---> cinder-scheduler
+
+    cinder组件：
+        cinder-api: 接收API请求，调用cinder-volume执行操作
+                客户端可以将请求发送到endpoints指定的地址，向cinder-api请求操作
+                cinder-api对接收到的HTTP API请求会做如下处理：
+                    1 检查客户端传人的参数是否合法有效
+                    2 调用cinder其他子服务的处理客户端请求
+                    3 将cinder其他子服务返回的结果序列号并返回给客户端
+
+        cinder-volume: 管理volume的服务，与volume provider协调工作，管理volume的生命周期。运行cinder-volume服务的节点被
+                        称作为存储节点 [agent]
+                        
+                       cinder-volume会定期向Cinder报告存储节点的空闲容量信息
+    
+        cinder-scheduler: scheduler通过调度算法选择最合适的存储节点创建volume
+                创建volume时，cinder-scheduler会基于容量、Volume Type等条件选择出最合适的存储节点，然后让其创建volume
+                
+            在/etc/cinder/cinder.conf中，cinder通过scheduler_driver, scheduler_default_filters和scheduler_default_weights
+            这三个参数来配置cinder-scheduler
+
+                scheduler_default_filters=AvailabilityZoneFilter,CapacityFilter,CapabilitiesFilter
+
+                    AvailabilityZoneFilter: 与Nova一样，可以把物理节点划分为不同的Availability Zone
+
+                    CapacityFilter: 将存储空间不能满足Volume创建需求的存储节点过滤掉                    
+
+                    CapabilitiesFilter: 不同的Volume Provider由自己的特性，比如是否支持thin provision等。Cinder允许用户
+                                        创建volume时通过Volume Type指定需要的Capabilities;通过Volume Type的Extra Specs
+                                        可以定义Capabilities
+                                        相关命令: cinder type-list
+
+                    Weight: 通过scheduler_default_weighers指定计算权重的weigher,默认为CapacityWeigher。CapacityWeiger
+                            基于存储节点的空闲容量计算权重值，空闲容量最大的胜出
+                        
+            
+        volume provider: 数据的存储设备，为volume提供物理存储空间。 cindler-volume支持多种volume provider,每种volume
+                        provider 通过自己的driver与cinder-volume协调工作  [driver]
+
+    Driver：在cinder-volume的配置文件/etc/cinder/cinder.conf中volume_driver配置项设置该存储节点使用哪种volume provider的driver
+
+        
+    创建卷流程：
+        cinder-api:
+            1 cinder-api接收到一个POST类型的REST API请求后，分析HTTP body，解析请求信息
+            2 启动一个Flow(工作流)，Flow的执行状态依次为PENDING,RUNNNING和SUCCESS
+            3 volume_create_api工作流包含若干Task,每个Task完成特定的任务。任务依次为ExtractVolumeRequestTask, QuotaReserveTask,
+                EntryCreateTask, QuotaCommitTask, VolumeCastTask
+            
+                ExtractVolumeRequestTask：获取request信息
+                QuotaReserveTask:预留配额
+                EntryCreateTask: 在数据库中创建volume条目        
+                QuotaCommitTask:确认配额
+                VolumeCastTask:向cinder-sheduler发送消息，开始调度工作            
+            4 Flow volume_create_api已经完成，状态由RUNNING变为SUCCESS
+    
+        cinder-scheduler：
+            1 cinder-scheduler创建一个volume_create_scheduler的Flow
+            2 该Flow依次执行ExtractSchedulerSpecTask和SCheduleCreateVolumeTask
+            3 ScheduleCreateVolume执行filter和weighting操作
+            4 经过AvailabilityZoneFilter、CapacityFilter、CapabilitiesFilter和CapacityWeigher层层筛选，
+              最终选择了存储节点
+            5 cinder-scheduler发送信息给选中的cinder-volume
+
+        cinder-volume:
+            1 cinder-volume启动一个volume_create_manager Flow来完成volume创建工作
+            2 volume_create_manager首先执行ExtractVolumeRefTask，OnFailureRescheduleTask,ExtractVolumeSpecTask,
+                NotifyVolumeActionTask为volume创建做准备。
+            3 接下来CreateVolumeFromSpecTask执行volume创建任务
+            4 最后CreateVolumeOnFinishTask完成扫尾工作    
+            
+    虚拟机添加盘：(attach volume to instance)
+        存储节点上本地的LV如何挂载到计算节点的instance上呢？通常情况存储节点和计算节点是不同的物理节点。通过iscsi
+                Target:提供ISCSI存储资源的设备，就是ISCSI服务器
+                Initator:使用ISCSI存储资源的设备，也就是ISCSI客户端
+
+                Initator需要与target建立ISCSI连接，执行login操作，然后就可以使用target上面的块存储设备
+                Target提供的块存储设备支持多种实现方式，博客里面使用的是LV
+                Cinder的存储节点cinder-volume默认使用tgt软件来管理和监控ISCSI target，在计算节点nova-compute使用iscsiadm执行
+                initiator相关操作
+
+        cinder-api:
+            1 初始化volume的连接
+                Volume创建后，只是在volume provider中创建了相应存储对象(比如LV)，这时计算节点是无法使用的。Cinder-volume需要以某种
+                方式将volume export出来，计算节点才能后访问得到。这个export的过程就是”初始化volume的连接“。相关Initialize_connection
+                的具体工作主要由cinder-volume完成
+            2 Attach volume
+                初始化volume连接后，计算节点将volume挂载到指定的instance,完成attach操作。Attach的具体工作主要由nova-compute完成
+
+        cinder-volume初始化volume的连接：
+            cinder-volume接收到initalize_connection消息后，会通过tgt创建target,并将volume所对应的LV通过target export出来。
+            通过命令tgtadm --lld iscsi --op show --mode target可以看到LV /dev/cinder/volume-uuid通过target 1 export出来
+        
+        nova-compute将volume attach到instance
+            计算节点作为iscsi initiator 访问存储节点iscsi target上的volume,并将其attach到instance
+            
+            nova-compute依次执行iscsiadm的new, update, login, rescan操作访问target上的volume
+                    iscsiadm -m node -T target -p ip:port --interface default --op new
+                    iscsiadm -m node -T target -p ip:port --op update -n node.session.auth.password -v
+                    iscsiadm -m node -T target -p ip:port --login
+                    iscsiadm -m node -T target -p ip:port --rescan
+
+            计算节点将iscsi target 上的volume识别为一个磁盘文件 (/dev/disk/by-path)
+            然后通过更新instance的XML配置文件将volume映射给instance
+        
+            在存储节点执行tgt-admin --show --mode target，会看到计算节点作为iniator已经连接到target1。
+
+    虚拟机卸载硬盘：(detach volume)
+        
+        cinder-api:
+            cinder-api发送detach消息；Detach操作由nova-compute和cinder-volume共同完成：
+                1 首先nova-compute将volume从instance上detach,然后断开与iscsi target的连接
+                2 最后cinder-volume删除volume相关的iscsi target
+
+        nova-compute detach volume:
+            nova-compute首先将volume从instance上detach, 然后断开与iscsi target的连接
+            具体操作：
+                1 将缓存中的数据Flush到volume (blockdev --flushbufs /dev/sdb)
+                2 删除计算节点上volume对应的SCSI设备
+                3 通过iscsiadm的logout,delete操作断开与iscsi target的连接
+                    iscsiadm -m node -T target -p ip:port --logout
+                    iscsiadm -m node -T target -p ip:port --op delete
+        cinder-volume 删除target
+            存储节点cinder-volume通过tgt-admin命令删除volume对应的target:
+                tgt-admin  --force --delete target
+    
+    磁盘扩容： extend volume
+        Extend操作用于扩大Volume的容量，状态为Available的volume才能够被extend。如果volume当前已经attach给instance,需要先
+        detach后才能extend
+
+        cinder-api:
+            cinder-api接收到extend volume的请求后，发送extend消息
+        
+        cinder-volume extend volume:
+            cinder-volume执行lvextend命令extend volume
+
+    删除卷操作：
+        cinder-api:
+            cinder-api发送delete消息
+
+        cinder-volume delete volume:
+            cinder-volume执行lvremove命令delete volume
+            这里比较有意思的是：cinder-volume执行的是"安全"删除。所谓"安全"实际上就是将volume中的数据抹掉,LVM driver使用的是
+            dd操作将LV的数据清零。
+                    dd if=/dev/zero of=/dev/mapper/...  count=3072 bs=1M oflag=direct 
+            删除lv
+                    lvremove --config activation {retry_deactivation=1} -f [volume_name]
+    
+    创建磁盘快照：
+         cinder-api:
+            当前volume已经attach到某个instance,创建snapshot可能导致数据不一致。可以先pause instance,或者确认当前instance没有大量
+            的磁盘IO，处于相对稳定的状态，则可以创建snapshot,否则还是先detach volume在做snapshot
+
+         cinder-volume执行lvcreate命令创建snapshot:（使用lvm的snapshot原理）
+            lvcreate --name [snapshot-name] --snapshot [volume-name] -L size
+            对于LVM volume provider, snapshot实际上也是一个LV，同时记录了与源LV的snapshot关系，可以通过lvdisplay查看
+
+         有了snapshot，就可以将volume回朔到创建snapshot的状态，方法就是通过snapshot创建新的volume ???
+         如果一个volume存在snapshot,则这个volume是无法删除的，因为snapshot依赖于volume, snapshot无法独立存在
+
+         在LVM作为volume provider的环境中，snapshot是从源volume完全copy而来的，所以这种依赖关系不强
+         但在其他volume provider,snapshot通常是源volume创建快照时数据状态的一个引用(指针)，占用空间非常小，在这种实现方式里snapshot
+         对源volume的依赖就非常明显了
+
+    磁盘备份: backup volume
+        备份与快照的区别：
+            1 snapshot依赖与源volume, 不能独立存在；而backuo不依赖源volume,即便源volume不存在了，也可以restore
+            2 snapshot与源volume通常存放在一起，都由同一个volume provider管理；而backup存放在独立的备份设备中，有自己的备份方案和
+                实现，与volume provider没有关系
+            3 backup具有容灾功能；而snapshot只能提供回朔功能
+
+        cinder-backup：
+            cinder的backup功能是由cinder-backup服务提供的;cinder-backup也通过driver架构支持多种备份backend,包括POSIX文件系统、
+            NFS、Ceph、GlusterFS、Swift   
+            
+            cinder-backup收到cinder-api发送的消息后，
+                1 启动backup操作，mount NFS
+                2 创建volume的临时快照
+                3 创建存放backup的container目录
+                4 对临时快照数据进行压缩，并保存到container目录 Compressed
+                5 创建并保存sha256(加密)文件和metadata文件
+                6 删除临时快照
+
+        cinder backup-create里由--incremental选项，表示可以执行增量备份
+
+    磁盘恢复：   restore volume
+        restore的过程很简单：
+            1 在存储节点上创建一个空白volume
+                cinder-api接收到restore请求后，转发请求；为restore创建volume。之后cinder-scheduler和cinder-volume
+                将创建空白volume,这个过程与create volume一样
+
+            2 将backup的数据copy到空白volume上
+                1 启动restore操作，mount NFS
+                2 读取container目录中metadata
+                3 将数据解压并写到volume中
+                4 恢复volume的metadata,完成restore操作
+
+    Boot from volume:
+        volume 既可以做instance的数据盘，也可以作为启动盘。原有两种方式：image launch(Boot from image), snapshot launch(Boot 
+        from snapshot),使用镜像文件作为启动盘
+        
+        还有另外三种方式
+            Boot from volume: 直接从现有的bootable volume launch
+            Boot from image(create a new volume): 创建一个新的volume,将image的数据copy到volume,然后从该volume launch
+            Boot from volume snapshot(create a new volume): 通过指定的volume snapshot创建volume, 然后从该volume launch,
+                当然前提是该snapshot对应的源volume是bootable的
+
+            boot from volume的instance也可以执行live migrate
+            
+        问题：生成的libvirt.xml文件中，没有记录启动盘；qemu是如何决定启动盘的?
+
+    NFS Volume Provider部署流程:
+        NFS Volume Provider:
+            就是NFS Server,提供远程NFS目录，NFS Client可以mount这些远程目录到本地，然后像使用本地目录一样创建、读写文件以及子目录
+        
+        cinder-volume:
+            存储节点通过NFS driver管理NFS volume provider中的volume,这些volume在NFS中实际上是一个个文件
+
+        nova-compute:
+            计算节点将NFS volume provider存放volume的目录mount到本地，然后将volume文件作为虚拟硬盘映射给instance
+            1 在Cinder的driver架构中，运行cinder-volume的存储节点和Volume Provider可以是完全独立的两个实体。cinder-volume通过
+               driver与Volume Provider通信，控制和管理volume
+            
+            2 Instance读写volume时，数据流不需要经过存储节点，而是直接对Volume Provider中的volume进行读写
+            3 其他Volume Provider也遵循这种控制流与数据流分离的设计
+
+        配置NFS Volume Provider:
+            在/etc/cinder/cinder.conf中添加nfs backend
+                1 enabled_backends= lvmdriver-1,nfs 让cinder-volume使用nfs backend
+                2 [nfs]中详细配置nfs backend, 包括：
+                    a 指定存储节点上/nfs_storage为nfs的mount point
+                    b 查看/etc/cinder/nfs_shares活动nfs共享目录列表，里面记录了远端nfs地址和目录
+                    c nfs volume driver
+                        volume_driver=cinder.volume.drivers.nfs.NfsDriver
+                    d 设置volume backend name 在cinder中需要根据这里的volume_backedn_name 创建对应的volume type
+                        volume_backedn_name = nfs
+
+            创建nfs volume type:
+                1 创建volume type
+                2 点击view Extra Specs, 输入key: volume_backend_name value:nfs， 点击创建
+                3 创建volume时，指定volume 的type 为nfs
+-------------------------------------------------------------------------------------------------------------
+neutron 服务：
+    Neutron的功能：二层交换、三层路由、负载均衡、防火墙和VPN
+        二层交换Switching:
+            Nova的Instance是通过虚拟交换机连接到虚拟二层网络的。Neutron支持多种虚拟交换机，包括Linux原称的Linux Bridge和
+            Open vSwitch。利用Linux Bridge和OVS,Neutron除了可以创建传统vlan网络，还支持创建基于隧道技术的Overlay网络：
+                Vxlan和GRE
+    
+        三层路由Routing:
+            Instance可以配置不同网段的IP,Neutron的router（虚拟路由器）实现instance跨网段通信。router通过IP forwarding, 
+            iptables等技术实现路由和NAT
+
+        负载均衡Load Balancing:
+            LBaaS支持多种负载均衡产品和方案，不同的实现以Plugin的形式集成到Neutron，目前默认的Plugin是HAProxy
+        
+        防火墙Firewalling:
+            Security Group: 通过iptables限制进入instance的网络包
+            Firewall-as-a-Service: 限制进出虚拟路由器的网络包，也是通过iptables实现
+
+    Neutron管理的网络资源包括Network, subnet和port:
+        network: network是一个隔离的二层广播域。Neutron支持多种类型的network
+
+            local: local网络与其他网络和节点隔离。local网络中的instance只能与位于同一节点上同一网络的instance通信
+
+            flat:  flat网络是无vlan tagging的网络。flat网络中的instance能与位于同一网络的instance通信，并且可以跨多个节点
+
+            vlan: vlan网络是具有802.1q tagging的网络。
+
+            vxlan: 基于隧道技术的overlay网络。vxlan通过唯一的segmentation ID与其他vxlan网络区分。vxlan中数据包回通过VNI封装
+                    称UDP包进行通信
+            
+            GRE: 与vxlan类似的一种overlay网络。GRE是使用IP封包
+    
+        subnet:是一个IPv4或者IPv6地址段。instance的IP从subnet中分配。每个subnet需要定义IP地址的范围和掩码
+            subnet与network是1对多关系。一个subnet只能属于某个network;一个network可以有多个subnet,这些subnet可以是不同的
+            IP段，但不能重叠。
+
+        Port: port可以看作虚拟交换机上的一个端口。port上定义了MAC地址和IP地址，当instance的虚拟网卡VIF(Virtual Interface)绑定到
+            port时，port会将MAC和IP分配给VIF
+
+        Project,Network,Subnet,Port和VIF之间关系
+            Project 1：m Network 1: m Subnet 1:m Port 1:1 VIF m:1 Instance 
+            
+    Neutron架构：
+        Neutron Server： 对外提供OpenStack网络API,接收请求，并调用Plugin处理请求
+        Plugin: 处理Neutron Service发来的请求，维护Openstack逻辑网络的状态，并调用Agent处理请求
+        Agent: 处理Plugin的请求，负责在network provider上真正实现各种网络功能
+        network provider: 提供网络服务的虚拟或物理网络设备，例如Linux Bridge, Open vSwitch或者其他支持Neutron的物理交换机
+        Queue： Neutron Server,Plugin和Agent之间通过Messaging Queue通信和调用
+        Database: 存放OpenStack的网络状态信息，包括Network, Subnet, Port, Router等
+        

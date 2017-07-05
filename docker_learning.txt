@@ -1,0 +1,83 @@
+一 容器知识体系结构：
+
+容器生态系统：
+    容器核心技术：
+        容器规范：容器不光是Docker还有其他容器；Docker、CoreOS、Google在内的若干个公司共同成立了一个叫Open Container Initiative
+                （OCI）的组织，其目的是指制定开放的容器规范。目前OCI发布了两个规范：runtime spec和image format spec
+        
+        容器runtime: runtime是容器真正运行的地方。runtime需要跟操作系统kernel紧密协作，为容器提供运行环境。
+                    Java 程序就好比是容器，JVM 则好比是 runtime。
+                    lxc是linux上的容器runtime,runc是Docker的容器runtime,rkt是CoreOS开发的容器runtime。Docker最初也是用lxc作为
+                    runtime
+            
+        容器管理工作：
+                    lxd是lxc对应的管理工具；docker engine是runc的管理工作，包括后台deamon和cli两部分。rkt的管理工具是rtk cli
+        
+        容器定义工具：
+                    docker image是docker容器的模板,runtime根据docker image创建容器
+                    dockerfile 是包含若干命令的文本文件，可以通过这些命令创建出docker image
+                    ACI（App Container Image）与docker image类似，面向CoreOS开发的rkt容器的image格式
+    
+        Registry:
+                    容器通过image创建的，存放image的仓库是Registry
+                    可以通过Docker Registry构建私有的Registry, Docker Hub和Quay.io是另一个公众托管Registry
+
+        容器OS:      容器OS是专门运行容器的操作系统。CoreOS、atomic和ubuntu core
+                    
+    容器平台技术： 容器核心技术使得容器能够在单个host上运行。而容器平台技术能够让容器作为集群在分布式环境中运行。
+
+        容器编排引擎：
+                    基于容器的应用一般会采用微服务架构。在这种架构下，应用被划分为不同的组件，并以服务的形式运行在各自的容器中，
+                    通过 API 对外提供服务。为了保证应用的高可用，每个组件都可能会运行多个相同的容器。这些容器会组成集群，
+                    集群中的容器会根据业务需要被动态地创建、迁移和销毁。
+
+                    所谓编排，通常包括容器管理、调度、集群定义和服务发现等。通过容器编排引擎，容器被有机的组合程微服务应用。
+                    docker swarm: Docker开发的容器编排引擎
+                    kubernets是Google开发的，支持Docker和CoreOS容器
+                    mesos是Apach的，mesos与marathon一起提供容器编排引擎
+
+        容器管理平台：
+                    通常容器管理平台能够支持多种编排引擎，抽象了编排引擎的底层实现细节，为用户提供更方便的功能，
+                    比如 application catalog 和一键应用部署等。
+                    Rancher和ContainerShip
+        基于容器的Paas:
+                    Deis、Flynn和Dokku
+    容器支持技术：
+
+        容器网络：
+                    docker network是Docker原生的网络解决反感。除此之外，还有flannel、weave和calico
+
+        服务发现：
+                    动态变化是微服务应用的特点。容器会动态添加、删除或者迁移。在这种动态的环境下，必须要有一种机制让client能够
+                    知道如何访问容器提供的服务。这就交由服务发现技术完成；服务发现会保存容器集群中所有微服武最新的信息，并提供API提供
+                    服务查询功能。典型解决方案:etcd、consul和zookeeper
+        
+        监控：     
+                    docker ps/top/stats是Docker原生的命令和监控工具。Docker stats API给用户提供HTTP请求接口，获取容器状态信息
+                    sysdig、cAdvisor/Heapster和Weave Scope是其他开源容器监控方案
+
+        数据管理：   Flocker提供持久化数据动态迁移
+
+        日志管理：   docker logs是Docker原生的日志工具   
+                    logspout对日志提供路由功能，收集不同的日志并转发给其他工具进行后处理
+        
+        安全性：
+                    OpenSCAP能够对容器镜像进行扫描，发现潜在的漏洞
+
+Docker的特性：
+    1 任何软件及其依赖 2 容器不需修改便可运行在几乎所有的平台上 3 资源、网络、库都是隔离的，不会出现依赖问题
+    4 提供run, start, stop等标准化操作，非常适合自动化 5 轻量级，能够快速启动和迁移 6 开发人员只需考虑怎么写代码；运维人员只需关心
+        如何配置基础环境
+
+Docker的架构：
+    1 Docker客户端-Client 
+    2 Docker服务器-Docker daemon 
+    3 Docker镜像-Image 
+    4 Registry
+    5 Docker容器-Container
+
+    Docker采用的是Client/Server架构。客户端向服务器发送请求，服务器负责构建、运行和分发容器。客户端和服务器可以运行在同一个Host上，
+        也可以通过socket或REST API与远程的服务器通信
+   
+
+

@@ -1,0 +1,238 @@
+nova-api源码分析 wsgi server 创建和启动流程：
+
+1）入口函数：nova/cmd/api.py: main
+
+根据解析配置文件中, enabled_apis参数，决定启动哪些api（ec2, osapi_compute, metadata）,
+	这里只分析osapi_compute流程
+
+分为两部分：launcher和 server初始化
+launcher负责启动wsgi server服务，launcher会根据server的workers属性，来决定启动几个wsgi server进程
+(launcher.launch_service)
+
+核心是wsgi server的池初始化(service.WSGIService nova/service.py WSGIService)
+	
+
+2）wsgi server初始化流程分为三个核心部分：
+self.loader = wsgi.Loader() #实例化一个wsgi loader对象，用来加在app
+
+self.app = self.loader.load_app(name) #执行deploy.loadapp()去加载app 这个加载流程，小杰鱼的app创建
+流程里面有介绍，其实就是去解读/etc/api-paste.ini配置文件：
+	服务的name是osapi_compute，所以对应的文件就是composite:osapi_compute配置项，详细流程暂时不去分析
+	假设确定是/v3:openstack_compute_api_v3,则查找composite:openstack_compute_api_v3配置项
+	这里面都是一些校验类：例如keystone对应的校验类，里面有request_id，faultwrap等，对应配置文件中的
+	filter:request_id, filter:faultwarp 
+	最后一项是真正的接口：osapi_compute_app_v21,对应的就是app:osapi_compute_app_v21配置项
+	而配置项记录的接口就是nova/api/openstack/compute/__init__.py:APIRouterV21中的factory方法,
+	即是返回APIRouter本身
+
+self.server = wsgi.Server(name, app, ...) #先分析app流程，后面在分析wsgi server流程
+	
+3）APIROuterV21 分析：
+	1 实例化一个api_extension_manager对象，这个对象中会加载插件，namespace是‘nova.api.v3.extesion’,对应setup.cfg
+	配置文件中的nova.api.v3.extesion，所以各个url对应的controller方法就是各个文件下的controller方法，可以在文件的
+	get_resource中确认
+	2 上一步骤中完成plugin的加载，然后将url中的url映射相应的controller
+	  _register_resources_check_inherits 负责映射基本方法
+	  _register_controllers 负责映射扩展方法：action或者extensions
+	
+	比如：虚拟机相关流程，url对应的就是server流程，相应的controller就是/nova/api/openstack/compute/plugins/v3/servers.py
+	中的ServersController
+----------------------------------------------------------------------------------------------	
+ServersController的分析和虚拟机创建流程：
+
+__init__流程：
+   compute_api初始化，会去查配置文件中的cells_type，假设是compute，则匹对CELL_TYPE_TO_CLS_NAME。
+   compute对应的就是nova/compute/api.py中的API类
+
+虚拟机创建流程：
+1 nova-api受到rest 请求之后，调用ServersController中的create方法；
+2 create方法中会先做参数的校验，然后调用self._create_instance
+3 _create_instance中做参数校验，生成虚拟机配置参数，执行_provision_instances在数据库中创建虚拟机的记录
+  然后通过compute_task_api.build_instances将请求下发给nova-conductor
+
+这里说以下compute_task_api的初始化，ServersController中有一个被property装饰的compute_task_api函数，
+这个调用conductor.ComputeTaskAPI方法，实例化一个ComputeTaskAPI对象，并传给compute_task_api	
+   ComputeTaskAPI方法中，检测配置文件中conductor.use_local的值，决定ComputeTaskAPI对象。这里假设返回的对象
+是conductor_api.ComputeTaskAPI（nova/conductor/api.py:ComputeTaskAPI）
+
+所以上述创建虚拟机的流程：
+4 执行ComputeTaskAPI中的build_instances，build_instances又会调用nova/conductor/rpcapi.py中ComputeTaskAPI
+  的build_instances方法，最终组装参数并发送build_instances的rpc请求
+
+	----------------------------------------------
+	这里说一下ComputeTaskAPI中的rpcclient
+	target:  topic=nova配置文件中的conductor.topic[conductor]  namespace=compute_task version=1.0
+	serializer: objects_base.NovaObjectSerializer
+	----------------------------------------------
+
+后续就要分析nova-conductor流程了
+
+-------------------------------------------------------------------------------------------------
+猜测：ComputeTaskAPI在初始化的时候，注册了APC的client端,并通过这个client发送的build_instances请求
+     这个client使用的targget, 对应的topic是nova配置文件中的conductor.topic, namespace是compute_task
+     后续需要分析messageing, 这里直接就找namespace是compute_task的server
+
+nova-conductor流程：
+入口函数： nova/cmd/conductor.py:main
+
+该函数初始化一个server, binary:nova-conductor, topic:nova配置文件中conductor.topic, manager:nova配置文件中
+conductor.manager
+后面的流程就是执行server.start
+这里重点就是topic和manager; topic对应的rpc, manager即是rpc对应的方法
+
+在server初始化的过程中，会根据nova配置文件中的conductor.manager来实例化一个对象，一般对应的是
+	nova/conductor/manager/ConductorManager
+	ConductorManager在初始化时，会初始化一个ComputeTaskManager对象，并加入到manager.additional_endpoints中
+
+在server初始化的过程中，也会实例化一个conductor_api对象，这个与上面nova-api流程相似
+
+在后续执行server.start过程中，会注册一个rpcserver,其中
+	target:  topic=self.topic(即是nova配置文件中conductor.topic[conductor]) server=self.host
+	endpoints:  [self.manager(即是上述说的manager对象)，baserpc对象, manager.additional_endpoints]
+	serializer: objects_base.NovaObjectSerializer
+
+
+--------------------------------------------------------------------------------------------------
+继续上述虚拟机创建流程：
+5 conductor收到rpc的通知后，可以ComputeTaskManager中找到对应的方法'build_instances'
+  这个函数主要分为两部分：找到部署该虚拟机的节点scheduler_client.select_destinations 和通知nova-compute执行
+  compute_rpcapi.build_and_run_instance
+
+ComputeTaskManager在初始化的时候，会构建几个对象：
+	compute_rpcapi: compute_rpcapi.ComputeAPI()
+	   构建与compute之间的rpc:
+		target: topic=compute_topic(配置文件中的compute_topic[compute]) version=4.0
+		version_cap:  
+		serializer: object_base.NovaObjectSerializer
+	image_api:
+	scheduler_client: scheduler_client.SchedulerClient()
+	   构建与scheduler之间的rpc:
+		查询对象queryclient: nova/scheduler/client/query.py:SchedulerQueryClient
+		    里面定义了一个scheduler_rpcapi[scheduler_rpcapi.SchedulerAPI], 其中会注册了一个rpc_client:
+			target: topic=CONF.scheduler_topic version=4.0
+			version_cap:
+			serializer:
+	            SchedulerQueryClient中的方法会使用select_destinations中的方法，执行rpc请求
+		反馈对象reportclient: nova/scheduler/client/report.py:SchedulerReportClient
+			类里面只有一个update_resource_stats函数
+	
+6 scheduler_client.select_destinations [conductor流程]
+  执行上述流程中SchedulerAPI中的select_destinations方法，该方法会执行call 'select_destinations'
+
+----------------------------------------------------------------------------------------------------------------
+scheduler服务启动和相关流程
+服务与上面的介绍的conductor类似，参数有些区分，只有binary:nova-scheduler topic:CONF.scheduler_topic[scheduler]
+主要是找到manager, server的create流程里面会检查是否有manager传参；如果没有，就根据binary,解析出来的名称是scheduler_manager
+在nova/service.py中上面可以找到cfg的配置，其中scheduler_manager对应的就是nova.scheduler.manager.SchedulerManager
+
+scheduler对应的rpc_server： topic=CONF.scheduler_topic
+SchedulerManager初始化流程：
+     实例化scheduler的driver: scheduler_driver = CONF.scheduler_driver (nova.scheduler.filter_scheduler.FilterScheduler)	
+     
+     实例化_SchedulerManagerV3Proxy对象，并添加到additional_endpoints中, _SchedulerManagerV3Proxy中只有一个函数select_destinations，
+     被messaging.expected_exceptions装饰，SchedulerManager中也有select_destinations,我们假定使用manager中的函数
+ 	
+7 虚拟机创建流程中，conductor发送select_destinations的rpc通知后，由scheduler服务去响应。如上述流程介绍，
+  scheduler接收到conductor的请求之后，执行SchedulerManager对象中的select_destinations方法，该方法会简介使用scheduler_driver对应的
+  select_destiantions方法。该方法的核心就是执行FilterScheduler对象的_scheduler方法。
+  _scheduler方法真正执行节点查找操作：
+	1 _get_all_host_states 获取当前环境中所有计算节点的状态
+	2 get_filtered_hosts 根据filter查找合适的节点
+	3 get_weighed_hosts 按照一定策略进行排序，并找出前面几个节点(数量是nova配置文件scheduler_host_subset_size)
+	4 随即选出一个节点(random.choice)
+
+  因为conductor节点发起的call rpc动作，所以_scheduler选出的节点将会发给conductor服务
+ 
+8 compute_rpcapi.build_and_run_instance	[conductor流程]		
+  执行上述流程中ComputeApi对象中的build_and_run_instance，向指定节点的compute服务，发送rpc build_and_run_instance请求		
+  
+------------------------------------------------------------------------------------------------------------
+compute服务的启动和相关流程
+如前面的几个服务启动流程一样，也是定义了一个service，然后启动这个service。相关参数是：
+    binary: nova-compute topic:CONF.compute_topic db_allowed:CONF.conductor.use_local
+    如scheduler一样，在server create流程生成了compute服务的manager名称:compute_manager
+    查找nova配置文件，compute_manager=nova.compute_manager.ComputeManager, 所以server的manager就对应了
+    nova/compute/manager.py:ComputeManager
+这个类的初始化流程里，定义了很多与其他server和服务相关的接口
+
+ComputeManager类的初始化：
+    virt api: 定义了一个ComputeVirtAPI对象，这个对象的_compute就是ComputeManager本身
+    network api: 实例化一个network.API对象，根据nova配置文件中network_api_class找到该对象：
+                    nova.network.neutronv2.api.API
+    volume api: 实例化一个volume.API对象，同network一样，根据nova配置文件中volume_api_class找到该对象:
+                    nova.volume.cinder.API
+    image api: 实例化一个image.API对象，对象为nova.image.api.API
+    compute api: 实例化一个compute.API对象,根据配置文件得知，nova.compute.api.API
+    compute rpcapi: 实例化一个compute rpc对象compute_rpcapi.ComputeAPI 这个对象中初始化一个rpc client
+                    target: topic=CONF.compute_topic version=4.0
+                    version_cap:
+                    serializer:
+    conductor_api: 实例化一个conductor.API对象
+    compute_task_api: 实例化一个conductor.ComputeTaskAPI对象
+    consoleauth_rpcapi
+    cells_rpcapi: 实例化一个cells_rpcapi.CellsAPI对象，构建rpc client
+                    target: CONF.cells.topic version:1.0
+                    version_cap:
+                    serializer:
+    scheduler_rpcapi: 实例化一个scheduler对应的rpc对象scheduler_rpcapi.SchedulerAPI,构建rpc client
+                    target: CONF.scheduler_topic version: 4.0
+                    version_cap:
+                    serializer:
+    scheduler_client: 实例化schedulerclient对象，这个同conductor中一样，定义了SchedulerQueryClient和
+                       SchedulerReportClient对象
+    instace_events: 实例化一个InstanceEvents对象
+    向additional_endpoints添加_ComputeV4Proxy对象，这个映射compute rpc对应的函数
+    driver: 加载nova配置文件中compute_driver信息(libvirt.LibvirtDriver),并与nova.virt拼接，生成一个dirver名称
+            并生成一个 nova/virt/libvirt/driver.py: LibvirtDriver对象
+
+9 nova-compute服务收到conductor发过来的build_and_run_instances rpc请求后，执行ComputeManager下面的build_and_run_instance方法
+    这个方法中主要执行_locked_do_build_and_run_instance, 这个函数中更新instance的状态并执行_build_and_run_instance
+    
+10 _build_and_run_instance流程中,先执行_build_resources操作,_build_resources中构建网络和存储的信息；
+    _build_networks_for_instance 负责准备节点上的网络端口，_prep_block_device负责创建存储卷 这里暂时先不详细分析
+    之后_build_and_run_instances执行driver.spawn,对应LibvirtDriver中的spawn方法
+
+11 LibvirtDriver中的spawn方法执行虚拟机的构建
+    create_image: 处理那些不从cinder卷启动的虚拟机，为虚拟机建立临时磁盘
+    _get_guset_xml: 制作虚拟机xml的地方
+    _create_domain_and_network: 把前面准备的资源整合起来，执行plug_vifs把接口加入到openvswitch桥上，执行
+                                _create_domain使用libvirt创建虚拟机
+    
+    
+------------------------------------------------------------------------------------------------------
+1 nova-api在启动的过程中，加载app并构建wsgi服务 app做为wsgi的site 外面传过来的http请求，交给app流程处理
+2 app在加载过程中，回去查询api-paste.ini配置文件，根据不同的认证方式，注册http请求校验方法，并注册一个APIRouter对象
+3 在APIRouter对象注册的过程中，会根据参数(namespace)和setup.py配置文件，加载插件，生成url的resource与controller的映射
+  即是传过来的http请求，会根据url中的resource找到对应controller的方法。创建虚拟机的请求就是发送server请求，根据该请求，就会
+  调用ServersController中的create方法
+4 create方法处理和检查参数，生成虚拟机数据库信息，生成filter条件并向nova-conductor服务发送rpc build_instance请求
+5 nova-conductor接收到build_instance的rpc请求之后，向nova-scheduler服务发送select_destinations请求，确定虚拟机部署的节点
+6 nova-scheduler服务收到nova-conductor发送的请求后，先获取所有计算节点当前的信息(资源信息)，然后根据filter，过滤出满足条件的host
+  在经过权重排序，找到一定数量的主机，在从随机挑选出来一个主机作为运行虚拟机的节点
+7 nova-scheduler服务选出节点之后，发给nova-conductor, nova-conductor拿到主机信息之后，向该主机的nova-compute服务发送
+  build_and_run_instance请求
+
+
+
+oslo_conf    ?
+oslo_log     ?
+oslo_message ?
+oslo_context ?
+oslo_utils ?
+
+sqlalchemy ?
+stevedore ?
+
+notifer? rpc.get_notifier
+
+
+
+
+
+
+
+
+
+
+
+

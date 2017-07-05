@@ -1,0 +1,745 @@
+6月8日：
+上午：
+目标：疏缕虚拟机相关的业务流程，重点在虚拟机创建，开机，快照，迁移，备份恢复流程。参考内容 cloudman的博客nova部分
+nova服务部署情况：
+    计算节点：nova-compute
+    控制节点：nova-api, nova-scheduler, nova-conductor, nova-cert
+
+nova服务介绍：
+    nova-pai: 整个nova组件的门户，所有对nova的请求都首先由nova-api处理
+        1 检查客户传入的参数是否合法有效
+        2 调用nova其他子服务处理客户端HTTP请求
+        3 格式化Nova其他子服务返回的结果并返回给客户端
+
+    nova-conductor: cloudman介绍说这个服务是操作nova数据库的，但在分析kilo版本代码时
+        发现写数据库是在nova-api流程，这个服务只是一个中间执行者(通知scheduler和compute服务)
+        所以具体功能有待确认
+
+    nova-scheduler: 解决如何选择在哪个计算节点上启动instance的问题
+        虚拟机在创建时，会指定flavor,flavor主要定义了vcpu, ram, disk, metadata四个类
+        nova-scheduler会按照flavor去选择合适的计算节点。
+        
+        在/etc/nova/nova.conf中,nova通过scheduler_dirver, scheduler_available_filters和  
+        scheudler_default_filters三个参数来配置nova-scheduler的，其中scheduler_driver表示第三方scheduler
+        
+        nova.conf中的scheduler_availabel_filters选项用于配置scheduler可用的filter，默认是所有nova自带的filter
+        都可以用户过滤操作
+        scheduler_default_filters用于指定scheduler真正使用的filter，默认值为：
+        scheduler_default_filters = RetryFilter, AvailabilityZoneFilter, RamFilter, DiskFilter, 
+            ComputeFilter, ComputeCapabilitiesFilter, ImagePropertiesFilter, ServerGroupAntiAffinityFilter
+            ServerGroupAffinityFilter
+        
+            RetryFilter:用于刷掉之前已经调度过的节点；如果之前有A，B，C三个节点都通过过滤，选择A节点创建虚拟机，但是创建失败了，
+                RetryFilter就会将A直接刷掉
+            AvailabilityZoneFilter: 为提高容灾和隔离服务，可以将计算节点划分到不同的Availability Zone中。创建Instance
+                时，需要指定将Instance部署到在哪个Availability Zone中，AvailabilityZoneFilter将不属于指定
+                Availability Zone的计算节点过滤掉
+            RamFilter: 将不能满足flavor内存需求的计算节点过滤掉。为了提高系统资源使用率，可以支持超配，
+                ram_allocation_ration是超配比率
+            DiskFilter: 将不能满足flavor磁盘需求的计算节点过滤掉(没理解)超配比率disk_allocation_ratio
+            CoreFilter: 将不能满足flavor vCPU需求的计算节点过滤掉 超配比率cpu_allocation_ratio
+            ComputeFIlter: 保证只有nova-compute服务正常工作的计算节点才能被nova-scheduler调度
+            ComputeCapabilitiesFIlter: 根据计算节点的特性来筛选。例如平台下节点有x86_64和ARM架构的，如果Instance需要
+                x86_64架构，则通过ComputeCapabilitiesFilter进行过滤。Compute的Capabilities在flavor的Metadata中指定的
+            ImagePropertiesFIlter: 根据所选image的属性来筛选匹配的计算节点。如果image只能运行在kvm的hypervisor上，可以通过
+                页面"Hypervisor Type"指定，这个值也会包含在flavor的Metadata中
+            ServerGroupAntiAffinityFilter和ServerGroupAffinityFilter用于将instance均分或者集中部署在集群下的某些节点中
+                提前按照ServerGroup划分物理节点
+
+        过滤之后，nova-scheduler会计算权重，将可选节点进行排序。nova-scheduler默认实现是根据计算节点空闲的内存量计算权重值，
+            空闲内存越多，权重越大,instance将被部署在当前空闲内存最多的计算节点上
+
+    nova-compute服务：在计算节点上运行，负责管理节点上的instance。某个特定计算节点上只会运行一种Hypervisor，在/etc/nova/nova.conf
+        的compute_driver设定
+        
+        nova-compute的功能分为两类：定时向openstack报告计算节点的状态，实现instance生命周期的管理
+            1 定时向openstack报告计算节点：
+                每隔一段时间，nova-compute就会报告当前计算节点的资源使用情况和nova-compute服务状态
+                nova-compute通过Hypervisor的driver拿到计算节点的资源使用详细情况
+            2 实现instance生命周期的管理：通过nova-compute实现instance的主要操作: launch,shutdown,reboot等
+                nova-compute创建isntance分为4步：
+                    1 为instance准备资源：根据指定的flavor依次为instance分配内存、磁盘空间和vCPU,网络资源也提前分配
+                                        (_allocate_network_async)
+                    2 创建instance的镜像文件:通过glance将image下载到计算节点，然后将其作为backing file创建instance的
+                            镜像文件(需要将qemu-img将qcow2 image转换程raw,因为instance的镜像文件backingfile 不能是
+                            qcow2格式的?)                    
+                    3 创建instance的XML定义文件:xml文件会保存在/opt/stack/data/nova/instances/目录下                
+                    4 创建虚拟网络并启动虚拟机:
+
+    通过日志文件，快速查找信息：
+        1 先确定大的范围，比如在操作之前用tail -f 打印日志文件，这样需要查看的日志肯定在操作之后的打印输出的这些内容里。另外
+            也可以通过时间戳来确定需要的日志范围
+        2 利用“代码模块”快速定位有用的信息。nova-*子服务都有自己特定的代码模块：
+                nova-api: nova.api.openstack.compute.servers  nova.compute.api nova.api.openstack.wsgi
+                nova-compute: nova.compute.manager nova.virt.libvirt.*
+        3 利用Request ID查找相关的日志信息。Request ID是跨日志文件的，这个特性能帮助我们在其他子服务的日志文件中找到相关信息，
+    
+
+虚拟机相关操作：
+    关机操作：
+        nova-api: 向指定节点的nova-compute发送消息“关闭instance”
+        nova-compute: 收到消息之后，执行Instance shutdown操作
+    开机操作：
+        nova-api: 向指定节点的nova-compute发送消息"start instance"
+        nova-compute: 1 准备物理网卡 2 准备instance的XML文件 3 准备instance的镜像文件 4 启动虚拟机
+
+    重启操作：
+        重启分为soft reboot和hard reboot; soft reboot是重启操作系统，instance一直处于运行状态；
+        hard reboot是重启instance,相当于关机之后在开机
+    Lock/Unlock:
+        为了避免误操作，将instance加锁。Lock/Unlock操作都是在nova-api中进行的，与nova-compute无关
+    删除操作：
+        nova-api: 向指定节点的nova-compute发送消息"删除 instance"
+        nova-compute: 1 关闭instance 2 删除instance的镜像文件 3 释放虚拟网络等其他资源
+    pause/resume操作：
+        需要短时间暂停instance,可以通过pause操作将instance的状态保存到宿主机的内存中，当需要恢复时候，执行Resume操作
+        从内存中读回instance的状态，然后继续运行instance
+    suspend/resume操作：
+        需要长时间暂停instance，可以通过suspend操作将instance的状态保存到宿主机的磁盘上。当需要恢复时候，执行resume操作，从
+        磁盘读回instance的状态，使之继续运行
+        
+        suspend与pause相同点：
+            两者都是暂停instance的运行，并保存当前状态，之后可以通过resume操作恢复
+        不同点：
+            1 suspend 将instance的状态保存在磁盘中；Pause 是保存在内存中，所以resume被pause的instance要比suspend快
+            2 suspend之后的instance，其状态是shutdown 而被pause的instance状态是paused
+            3 虽然都是通过resume操作恢复，pause对应的resume在openstack 内部被叫做unpause; suspend对应的resume才是真正的
+              resume
+        rescue/unrescue:
+            大体流程就是，通过rescue做出来两个启动盘，disk.rescue用作备份的，真正的启动盘disk作为第二个磁盘。当出现故障是，使用
+            disk.rescue作为启动盘
+    snapshot 备份操作(文中的说法，这个是备份流程)：
+        nova-api: 向目标节点发送消息"这个Instance做快照"
+        nova-compute: 1 暂停instance 2 对instance的镜像文件做快照 3 恢复instance 4 将快照上传到glance
+            疑问: cloudman文中写的 制作快照是qemu-image convert -f qcow2 -O qcow2 源卷 目标卷 (这个有问题把)
+    rebuild 恢复操作(文中的说法，这个是恢复流程):
+        nova-api: 向目标节点发送消息"Rebuild这个Instance"
+        nova-compute: 1 关闭instance 2 下载新的image,并准备instance的镜像文件 3 启动instance
+            疑问: cloudman文中写的 恢复流程就是 qemu-image create -f qcow2 -o backing_file=[image] 目标卷
+    shelve 操作：(文中的说法，这个是把虚拟机转换程镜像)
+        nova-api: 向目标节点发送消息"shelve这个Instance"
+        nova-compute: 1 关闭instance 2 对instance执行snapshot操作，成功之后snapshot生成的image会保存在glance上
+                        3 删除instance在宿主机上的资源
+    unshelve操作：glance中保存了instance的image, unshelve的过程其实就是通过该image launche一个新的instance，
+                nova-scheduler也会调度合适的计算节点来创建该instance instance unshelve后可能运行在与shelve之前不同的
+                计算节点上，但是instance的其他属性(比如flavor, IP等)不会改变 #这个需要确认一下
+        nova-api: 向目标节点发送消息"unshelve这个Instance"
+        nova-scheduler: 为instance选择合适的计算节点
+        nova-compute: 流程与launch instance 大体相同 1 为instance准备CPU、内存和磁盘资源 2 创建instance镜像文件
+                        3 创建instance的XML定义文件  4 创建虚拟网络并启动instance
+    Migrate 操作: (这个就是虚拟机迁移操作)
+        nova-api： 发送消息"迁移这个instance", 但是代码中实现是resize操作
+        nova-scheduler: 收到消息后，为instance选择合适的目标计算节点；scheduler在初始选择节点事，不会剔出源节点。筛选之后
+                        如果发现目标节点与源节点相同，会抛出依次，重新选择
+        nova-compute: nova-compute会在源计算节点和目标计算节点上分别执行操作
+            源计算节点： 1 开始migrate 2 在目标节点上创建instance的目录，如果touch失败，说明目标节点上还没有该instance的目录
+                    也就是说，源节点和目标节点没有共享存储 3 关闭instance 4 将instance的镜像文件通过scp传到目标节点上
+            目标计算节点：同launch instance流程，经过几个步骤： 1 为instance准备CPU、内存和磁盘资源 2 创建instance镜像文件
+                        3 创建instance的XML定义文件 4 创建虚拟网络并启动instance
+        confirm操作：上一步骤之后，instance会处于"Confirm or Revert Reszie/Migrate"状态，需要用户确认或者回退当前的迁移操作
+                    执行confirm按钮，nova-api接收到confirm的消息，源计算节点删除instance的目录，并在Hypervisor上删除instance
+        revert操作：
+                    1 nova-api接收到revert的消息 2 在目标计算节点上关闭instance，删除instance目录并在Hypervisor上删除instance
+                    3 源计算节点上启动instance(迁移的时候，在源节点上关闭了该instance, revert操作只需重新启动instance)
+        注意点：迁移过程中源和目的节点之间需要使用ssh和scp,为了使操作顺利进行，必须要保证nova-compute进程的启动用户能够在计算节点之间
+                无密码访问
+    Resize 操作：Resize的作用是调整instance的vCPU、内存和磁盘资源。Instance需要多少资源是定义在flavor中的，resize操作是通过为
+            instance选择新的flavor来调整资源的分配。Resize就是在Migrate的同时应用新的flavor
+        resize分为两种情况：
+            1 nova-scheduler选择的目标节点与源节点是不同节点。操作过程跟上一节Migrate几乎完全一样，只是在目标节点启动instance的时候
+            按新的flavor分配资源。同时，因为要跨节点复制文件，也必须要保证nova-compute进程的启动用户能够在计算节点之间无密码访问。
+            2 目标节点与源节点是同一个节点。则不需要migrate
+        2 流程：
+            nova-api:向目标节点发送一条信息"Resize 这个Instance"
+            nova-scheduler: 收到消息后，会为instancec选择合适的目标计算节点
+            nova-compute: 在目标节点上启动instance, 过程与launche instance类似
+                    1 按新的flavor为instance准备cpu、内存和磁盘资源 2 关闭instance 3 创建instance镜像文件
+                    4 将instance的目录备份一份，命名为<instance_id>_resize, 以便revert
+                    5 创建instance的XML定义文件 6 准备虚拟网络 7 启动instance
+            这里也有confirm 确认流程：
+                1 nova-api接收到confirm的消息 2 删除计算节点上备份的instance目录<instance_id>_resize
+            这里也有revert流程
+                1 nova-api接收到revert的消息 2 在计算节点上关闭instance 3 通过备份目录<instance_id>_resize恢复instance目录
+                4 重新启动instance
+    Live Migrade 操作：                                                        
+        Migrate操作会先将instance停掉，也就是所谓的"冷迁移" 而Live Migrate是"在线迁移", instance不会停机
+        Live Migrate分两种：1 源和目标节点没有共享存储，instance在迁移的时候需要将其镜像文件从源节点传到目标节点，这叫做
+            Block Migration（快迁移）2 源和目的节点共享存储, instance的镜像文件不需要迁移，只需要将instance的状态迁移到目标节点
+
+        源和目标节点需要满足一些条件才能支持Live Mirgation:
+            1 源和目标节点的CPU类型要一致 2 源和目标节点的Libvirt版本要一致
+            3 源和目标节点能互相时别对方的主机名称 4 在源和目标节点的/etc/nova/nova.conf中指明在线迁移时使用TCP协议
+            5 Instance使用config dirver保存其metadata。在Block Migration过程中，该config driver也需要迁移到目标节点
+            6 源和目标节点的Libvirt TCP远程监听服务得打开，需要在下面两个配置文件中做一点配置。
+                /etc/default/libvirt-bin  /etc/libvirt/libvirtd.conf
+        nova-api: 向目标主机发送消息“Live Migrate这个Instance”
+        nova-compute: 1 目标节点执行迁移前的准备工作，首先将instance的数据迁移过来，主要包括镜像文件、虚拟网络等资源
+            2 源节点启动迁移操作，暂停instance 3 在目标节点上 Resume instance
+            4 在源节点上执行迁移的后处理工作，删除instance 5 在目标节点上执行迁移的后续工作，创建XML，在Hypervisor中定义
+            instance,使之下次能够正常启动
+
+6月9日：
+上午：sougou面试，反正都过不去，放松;等kingsan就是了
+    考的东西全是算法，很惨烈；所以也能看得出自己基础方面，有非常严重的缺陷
+6月12日：
+上午：疏缕网络相关的业务流程参考内容 cloudman的博客neutron部分
+
+云环境下，租户可以按照自己的规划创建网络，不同租户的网络时可能重叠的。将路由功能放到namespace中，
+就能隔离不同租户的网络，从而支持网络重叠。
+
+当租户网络连接到Neutron router，通常将router作为默认网关。当router接收到instance的数据包，并将其转发到外网时：
+1 router会修改包的源地址为自己的外网地址，这样确保数据包转发到外网，并能够从外网返回。
+2 router修改返回的数据包，并转发给真正的instance,这个行为被称作Source NAT
+
+如果需要从外网直接访问instance,则可以利用floating IP:
+1 floating IP提供静态NAT功能，建立外网IP与instance租户网络IP的一对一映射。
+2 floating IP是配置在router提供网关的外网interface上的，而非instance中。
+3 router 会根据通信的方向修改数据包的源或者目的地址
+
+iptables 增加了两条处理floating IP的规则：
+1 当router接收到从外网发来的包，如果目的地址是floating IP，将目的地址修改为虚拟机的内部IP。这样外网的包就能送达到虚拟机
+2 当虚拟机发送数据到外网，源地址将被修改为floating IP
+
+vxlan:
+    vxlan提供与vlan相同的以太网二层服务，但是拥有更强的扩展性和灵活性。与vlan相比，vxlan有下面几个优势：
+    1 支持更多的二层网端。vlan使用12-bit标记 VLAN ID,最多支持4094个VLAN,这对于大型云部署会成为瓶颈。
+        VXLAN的ID (VNI或者VNID)则用24-bit标记
+    2 能更好地利用已有的网络路径。VLAN使用stp避免环路，这会导致有一半的网络路径被block掉。VXLAN的数据包是封装到UDP通过三层
+        传输和转发的，可以使用所有的路径。
+    3 避免物理交换机MAC表耗尽。由于采用隧道机制，TOR交换机无需在MAC表中记录虚拟机的信息。
+
+    VXLAN是将二层建立在三层上的网络。通过将二层数据封装到UDP的方式来扩展数据中心的二层网段数量。
+    VXLAN是一种在现有物理网络设施中支持大规模多租户网络环境的解决方案。VXLAN的传输协议是IP + UDP
+
+    VXLAN定义了一个MAC-in-UDP的封装格式。在原始的Layer2网络包前加上VXLAN header,然后放到UDP和IP包中。
+    通过MAC-in-UDP封装，VXLAN能够在Layer 3网络上建立起一条Layer 2的隧道。
+
+L2population:
+    L2Population的作用是在VTEP上提供Porxy ARP功能，使得VTEP能够预先获知VXLAN网络中如下信息：
+        1 VM IP -- MAC对应关系  2 VM -- VTEP对应关系
+    当VM A需要与VM G通信时：
+        1 Host1上的VTEP直接响应 VM A的ARP请求，告之VM G的 MAC地址。
+        2 因为Host 1上的VTEP知道VM G位于Host 4, 会将封装号的VXLAN数据包直接发送给Host 4的 VTEP
+    
+    VTEP是如何提前获知IP -- MAC --VTEP相关信息的呢？
+    1 Neutron 知道每一个port的状态和信息： port保存了IP, MAC相关数据
+    2 instance启动时，其port状态变化过程为: down -> build -> active
+    3 每当port状态发生变化时，Neutron 都会通过RPC消息通知各节点上的Neutron agent,使得VTEP能够更新VM和port相关信息
+    4 VTEP可以根据这些信息判断出其他Host上都有哪些VM,以及它们的MAC地址，这样就能直接与之通信，从而避免了不必要的隧道连接和广播。
+
+安全组：
+Neutron 为instance提供了两种管理网络安全的方法：安全组和虚拟防火墙
+安全组的原理是通过iptables对instance所在计算节点的网络流量进行过滤
+虚拟防火墙则由Neutron Firewall as a Service高级服务提供，其底层也是使用iptables,在Neutron ROuter上对网络包进行过滤
+
+默认的安全组限制所有ingress流量
+安全组有以下特性：
+    1 通过宿主机上iptables规则控制进出instance的流量
+    2 安全组作用在instance的port上
+    3 安全组的规则都是allow,不能定义deny的规则
+    4 instance可应用多个安全组叠加使用这些安全组的规则
+
+Fwaas:
+Fwaas是在Neutron虚拟router上应用防火墙规则，控制进出租户网络的数据
+
+Fwaas有三个重要概念：Firewall, Policy和Rule
+Firewall:租户能够创建和管理的逻辑防火墙资源，Firewall必须关联某个Policy,因此必须先创建Policy
+Firewall Policy: Policy是Rule的集合，Firewall会按顺序应用Policy中的每一条Rule
+Firewall Rule: Rule是访问控制的规则，由源与目的子网IP、源与目的端口、协议、allow或deny动作组成
+
+安全组与Fwaas之间的区别：
+1 安全组的应用对象是虚拟网卡，由L2 Agent实现，安全组会在计算节点上通过iptables规则来控制进出instance虚拟网卡的流量
+2 安全组只能定义allow规则
+3 安全组规则可以区分ingress 和egress
+
+1 Fwaas的应用对象是router,可以在安全组之前控制外部过来的流量,但是对于同一个subnet内的流量不作限制
+2 Fwaas可以定义allow或者deny规则
+3 Fwaas规则不能区分进出流量
+
+LBaas:
+LBaas有三个主要的概念：Pool Member, Pool和Virtual IP
+
+Pool Member: Pool Member是layer 4的实体，拥有IP地址并通过监听端口对外提供服务(172.16.100.9:80)
+Pool: Pool由一组Pool Member组成。这些Pool Member通常提供同一类服务。(同一类服务下，多个ip: port)
+Virtual IP: Virtual IP也称做VIP，是定义在load balancer上的IP地址。每个pool member都有自己的IP，
+        但对外服务则是通过VIP。 load balancer负责监听外部的连接，并将连接分发到pool member。外部client
+        只知道VIP，不知道也不需要关心是否由pool或者有多少个pool member。
+Openstack Neutron默认通过HAProxy来实现LBaaS
+
+Pool的配置:
+    参数： name, provider(默认是haproxy), subnet, protocol(http/https/tcp), 
+          Load Balancing Method（ROUND_ROUBIN, LEAST_CONNECTIONS, SOURCE_IP）
+
+    算法介绍：
+        round_roubin: load balancer按固定的顺序从pool中选择member相应client的连接请求。这种方法的不足是缺乏机制检测
+            member是否负载过重。有可能出现某些member由于处理能力弱而不得不继续处理新连接的情况。如果所有pool member具有
+            相同处理能力、内存容量、并且每个连接持续的时间大致相同，这种情况非常适合round robin，每个member的负载会很均衡。
+        LEAST_CONNECTIONS:
+            如果采用least connections算法，load balancer会挑选当前连接数量最少的pool member。这是一种动态的算法，需要
+            实时监控每个member的连接数量和状态。计算能力强的member能够更快的处理连接进而会分配到更多的新连接。
+        source_ip:  
+            如果采用source ip算法，具有相同source ip的连接会被分发到同一个pool member。source ip算法对于像购物车这种需要
+            保存状态的应用特别有用，因为我们希望用同一server来处理某个client连续的在线购物操作。
+
+VIP配置：
+    参数：name, VIP Subnet, IP address(可选，如果没有配置，会随即分配一个)， Protocol Port, Protocol(HTTP)
+         Session Persistence(SOURCE IP/HTTP COOKIE/APP COOKIE), admin state
+
+    Session Persistence:
+        Source IP: 这种方式与前面的load balance的source ip效果一样。初始连接建立后，后续来自相同source ip的client请求
+            会发送给同一个member。当大量client通过同一代理服务器访问vip时,source ip方式会造成member负载不均。
+        Http Cookie: 当client第一次连接到vip时，HAProxy从pool中挑选出一个member。当此member响应请求时，HAProxy会在应答
+            报文中注入命名为"SRV"的cookie,这个cookie包含了该member的唯一标识。client的后续请求都会包含这个"SRV" cookie。
+            HAProxy会分析cookie的内容，并将请求转发给同一个member。
+        APP Cookie: app cookie依赖于服务器端应用定义的cookie。比如app可以通过在session中创建cookie来区分不同的client。
+            HAProxy会查看报文中的app cookie,确保将包含app cookie的请求发送到同一个member。如果没有cookie，HAProxy会采用
+            ROUND_ROUBIN算法分配member。
+
+    Load Balance Method与Session Persistence的区别：
+        两者都涉及到如何选择pool member。它们之间的最大区别在于选择pool member的阶段不同：
+        1 Load Balance Method是为新连接选择member的方法
+        2 Session Persistence是为同一个client的后续连接选择member的方法
+
+Lbaas实现机制：在控制节点上运行ip netns,Neutron会新建一个namespace，以qlbaas开头，VIP是namespace上一个接口的ip地址。
+每一个pool,Neutron都会启动一个haproxy进程提供load balancering功能。
+haproxy配置文件(/opt/stack/data/neutron/lbaas/)
+    1 frontend使用的HTTP地址为VIP:80
+    2 backend使用的HTTP地址为172.16.100.10：80和172.16.100.0:80
+    3 balance方法为roundrobin
+
+ovs:
+    patch port是ovs bridge自己特有的port类型，只能在ovs中使用
+    1 连接两个ovs bridge,优先使用patch port。技术上veth pair也能实现，但性能不如patch port。
+    2 连接ovs bridge和linux bridge，只能使用veth pair
+    3 连接两个linux bridge,只能使用veth pair
+
+    openvswitch通过flow rule（流规则）来指定如何对进出br-int的数据进行转发，进而实现vlan之间的隔离
+
+    vxlan模型：
+        ovs的数据流向都是由flow规则控制的：
+        br-int的flow rule: 
+            br-int被当作一个二层交换机，规则的含义是:根据vlan和mac进行转发
+
+        br-tun的flow rule:
+            table 0 flow rule: 
+                1 从patch-int 进来的包，扔到table 2处理：
+                2 从vxlan接口进来的包，扔给table 4处理           
+
+            table 2
+                1 br-int发过来数据如果是单播包，扔给table 20处理
+                2 br-int发过来的数据如果是多播或者广播包，扔给table 22处理
+
+            table 4:
+                1 如果数据包从vxlan tunnel上来的报文，为其添加对应的vlan tag
+
+            table 10:
+                1 学习外部进来的包，往table 20中添加对返程包的正常转发规则，然后将报文发送到patch-int口
+            
+            table 20:
+                1 如果table 20里面有学习的流表，则匹配对应的流转发；否则交给table 22处理
+        
+            tbale 22:
+                1 去掉vlan tag,添加对应的vxlan tunnel 然后群发报文            
+6月13日：
+每天进步一点点 openstack组件研究
+1 Restful架构： 表现层状态转化；“表现层”其实指的是"资源(resources)"的"表现层"
+                资源: 网络上的实体，具体信息。一个具体的服务
+                资源的表现：可以使用URI(统一资源定位符)指向它，每种资源对应一个特定的URI。要获取这个资源，访问它的URI就可以
+
+        状态转化：代表客户端和服务器的一个互动过程
+            1 互联网通信协议HTTP协议，是一个无状态协议。所有的状态都保存在服务器端。如果客户端想要操作服务器，必须通过某种手段，
+            让服务器端发生“状态转化”。这中转化是建立在表现层之上的，所以就是“表现层状态转化”
+            2 客户端用到的手段，只能是HTTP协议。具体就是HTTP协议中四个表示操作方法的动词：GET，POST，PUT，DELETE。它们分别
+            对应四种基本操作：GET用来获取资源，POST用来新建资源，PUT用来更新资源，DELETE用来删除资源
+        Restful架构：
+            1 每一个URI(统一资源定位符)代表一种资源，表示的是资源的实体，而表现层则指的是资源的具体表现形式
+            2 客户端和服务器之间通过无状态的HTTP网络通信协议，传递这种资源的某种表现层(表现形式)
+            3 客户端通过四个HTTP动词，对服务器端资源进行操作，GET、POST、PUT、DELETE实现“表现层状态转化”
+
+什么是WSGI:
+    1 Restful只是设计风格而不是标准，而WSGI则是Python语言中所定义的Web服务其和Web应用程序之间或框架之间的通用接口标准
+    2 WSGI就是一座桥梁，桥梁的一端称为服务端或网关端，另一端称为应用端或者框架端,WSGI的作用就是在协议之间进行转化。WSGI将web组件
+        分为了三类：Web服务器（WSGI Server）、Web中间件(WSGI Middleware)与Web应用程序(WSGI Application)
+    3 Web Server接收HTTP请求，封装一系列环境变量，按照WSGI接口标准调用注册的WSGI Application，最后将响应返回给客户端。
+    4 WSGI Application是一个可被调用的python对象，它接收两个参数，通常为environ和start_response
+        1 参数environ指向一个python字典，要求里面至少包含了一些在CGI中定义的环境变量和WSGI所定义的环境变量，WSGI应用可以从
+            environ中获取相对应的请求及其执行上下文的所有信息。
+        2 参数start_response指向一个回调函数，回调函数负责执行客户端的请求并且返回结果。当有请求到来时，WSGI Server会准备好
+            environ和start_response参数，然后调用WSGI Application获得对应请求的响应。
+
+    environ变量都有哪些：environ字典中包含了在CGI规范中定义了的CGI环境变量
+        REQUEST_METHOD:HTTP请求的类型，比如GET或者POST 
+        SRIPT_NAME:URL请求中路径的开始部分，对应应用程序对象(?)，这样应用程序就知道它的虚拟位置。如果该应用程序对应服务器的
+                    根目录的话，它可能是空字符串  
+        PATH_INFO: URL请求中路径的剩余部分，指定请求的目标在应用程序内部的虚拟位置(?)。如果请求的目标是应用程序根目录并且没有
+                    末尾的斜杠的话，可能为空字符串。
+        QUERY_STRING:URL请求中跟在?后面的那部分，可能为空或不存在
+        CONTENT_TYPE: HTTP请求中任何Content-Type域的内容，可能为空或不存在
+        CONTENT_LENGTH: HTTP请求中任何Content-Length域的内容，可能为空或不存在
+        SERVER_NAME, SERVER_PORT:这些变量可以和SCRIPT_NAME、PATH_INFO一起组成完整的URL。
+        SERVER_PROTOCOL: 客户端发送请求所使用协议的版本。通常是类是HTTP/1.0或HTTP/1.1的东西，可以被用来判断如何处理请求包头
+
+        example:
+            from webob import Ruquest
+            req = Request.blank('/article?id=1')
+            print req
+            print '\n\n'
+            urll = ['%s : %s' % (key, value) for key, value in sorted(req.environ.items())]
+            print '\n'.join(urll)
+    相关模块：
+        1 wsgiref : wsgiref是一个实现wsgi规范的模块，它提供了操作WSGI环境变量和response头的工具，并且还实现了一个WSGI
+            服务器。
+        2 webob（WeboB）通过对WSGI的请求与响应进行封装来简化WSGI应用的编写
+            Webob中两个最重要的对象，一是webob.Request,对WSGI请求的environ参数进行封装，一是webob.Response包含了
+   
+paste和Webob：是与openstack密切相关的两个组件
+    Paste
+        1 OpenStack使用Paste和Deploy组件来完成WSGI服务器和应用的构建，每个项目源码etc目录下都有一个Paste配置文件
+        2 Paste配置文件分为多个section，每个section以type:name的格式命名，具体可以参考官网源码。使用Paste Deploy的主要目的
+            就是从配置文件中生成一个WSGI Application，有了配置文件之后，只需要使用下面的调用方式：
+                wsgi_app = loadapp('config:/path/to/config.ini')
+
+    Webob
+        1 Webob通过对WSGI的请求与响应进行封装来简化WSGI应用的编写。Webob中两个最重要的对象，一是Webob.Request,对WSGI请求的
+            environ参数进行封装，一是webbob.Response，包含了标准WSGI响应的所有要素。
+        2 webob：webob提供了包装后的WSGI请求(Request)环境，并辅助创建WSGI响应(Response)
+            1 Webob通过对WSGI的请求与响应进行封装来简化WSGI应用的编写。Webob中两个最重要的对象，一是webob.Request，对WSGI
+                请求的environ参数进行封装，一是webob.Response,包含了标准WSGI响应的所有要素。
+    对象方法添加装饰器wsgify，就可以不需要自定义request对象；
+        @wsgify
+        def __call__(self, req):
+            print req
+            print req.environ
+            return self.test(req)
+
+先看RabbitMQ和NOVA相关资料，然后在补充Restful
+    Restfall api的不足：
+        1 由于采用的是HTTP协议，客户端服务器之间所能传送的消息仅限于文本
+        2 客户端与服务器之间采用同步机制，当发送HTTP请求时，客户端需要等待服务器的响应
+        3 客户端和服务器之间可以单独开发，但是还是存在耦合
+
+    AMQP：AMQP(高级消息队列协议)是一个基于消息的中间件提供的开发的应用层标准协议。能够有效支持各种通信模型或者报文
+        传送方面的应用。一个完整的AMQP规格包括以下几个方面的性质
+        1 类型系统
+            AMQP是一套二进制的应用通信协议。它自定义了一套自描述的编码方案，使得它能够表示多种多样的常用数据类型。
+        2 进程间对程的异步通信协议
+            AMQP中，进程件通信多是采用点对点，或者发布者--订阅者模型。通常情况，由一个中间件实现消息队列的管理。
+            通信进程双方地位是均等的。发布者不需要知道订阅者是否存在，而订阅者也无需知道自己消费的是哪个发布者的消息。
+            这样的松耦合性，决定AMQP协议比传统的客户端-服务器通信模型具有更强的可扩展性。
+        3 消息格式
+            在AMQP中，将进程间传递的消息成为裸消息。裸消息：消息头(用户ID、消息主题和创建时间等)和消息体(应用程序需要真正
+            传递的数据，也称应用消息)裸消息在进程间通信过程中是不可改变的。当消息传送到中间节点，允许被注释
+        4 一系列标准化的但可扩展的“消息能力”
+            1 当两个节点通过AMQP通信时，他们不需要知道对方节点是什么节点，也不需要知道对方节点是如何处理发送的消息
+            2 订阅者可以拒绝或者接收发布者发送的消息
+            3 当有多个订阅者时，可采用竞争或非竞争的策略决定由哪个订阅者处理消息
+            4 可以根据需求自动地增加或删除节点
+            5 可以通过过滤器，修改订阅者的兴趣
+    
+    AMQP模型：发布者、中间件、订阅者三个部件构成。发布者和订阅者相对比较简单，中间件是连接发布者和订阅者的桥梁。
+            发布者首先将消息发送给中间件，中间件将消息存储到消息队列中，最后订阅者从消息队列中获取消息。
+            中间件的功能：消息的存储、交换和路由
+
+RabbitMQ介绍：
+    RabbitMQ是一个消息代理。核心原理：接收和发送消息。RabbitMQ做了三件事情：
+        1 收取请求，存储 交换 路由 2 存储请求信息 3 分发请求
+        
+    相关名词：
+        生产：发送消息。发送消息的程序就是一个生产者。
+        队列：消息通过你的应用程序和RabbitMQ进行传输，它们能够只存储在一个队列中。队列没有任何限制，你要存储多少消息  
+        都可以--基本上是一个无限的缓冲。多个生产者能够把消息发送给同一个队列，同样多个消费者也能够从同一个队列中获取数据。
+        消费：获取消息。一个消费者就是一个等待获取消息的程序
+
+    发送消息过程：
+        1 创建连接RabbitMQ服务器和创建通道
+        2 创建队列
+        3 发送消息
+        4 关闭连接
+    
+    获取数据过程
+        1 创建连接建立通道
+        2 创建队列 (为防止队列不存在，队列存在也不会重新创建)
+        3 接收消息 (接收消息需要一个回调函数)
+        4 启动程序，轮询等待消息
+
+     工作队列：为了避免等待一些占用大量资源、时间的操作。当我们把任务当作消息发送到队列中，一个运行在后台的工作者进程就会取出任务
+                然后处理。当你运行多个工作者，任务就会在它们之间共享。
+        概念理解：
+            1 循环队列：
+                使用工作队列(多个消费者接收处理队列中的消息)好处是能够并行处理队列消息(任务)。如果堆积很多任务或者消息，只需要
+                添加更多的工作者即可，扩展很简单。
+              RabbitMQ会按顺序得把消息发送给每个消费者(consumer)。平均每个消费者都会收到同等数量的消息。这种发送消息的方式叫做
+                --轮询
+            2 消息确认：
+                当运行的任务比较耗时，想确认消费者是否运行或者挂掉。一般当消息被RabbitMQ发送给消费者之后，马上就会在内存中移除。
+                这种情况，你只要把工作者停止，正在处理的消息就会丢失。
+                为了防止消息丢失，RabbitMQ提供了消息响应。消费者会通过一个ack（响应），告诉RabbitMQ已经收到并处理了某条消息，
+                然后RabbitMQ就会释放并删除这条消息。
+                使用no_ack=True标识就会把确认机制关闭
+            3 消息持久化:
+                为保证RabbitMQ服务器在退出或者崩溃的时候，丢失所有队列和消息，添加“队列”和"消息"持久化功能
+                
+                1 队列持久化：为了不让队列消失，需要把队列声明为持久化
+                    channel.queue_declare(queue='hello', durable=True)
+                    这个queue_declare必须在生产者和消费者对应代码中修改
+                2 消息持久化：将delivery_mode的属性设置为2
+                    channel.basic_publish(..., properties = pika.BasicProerties(delivery_mode = 2,))
+                上述设置RabbitMq把消息保存到硬盘，但从RabbitMQ收到消息到保存之间还是有一个很小的时间间隔。RabbitMQ并不是
+                所有的消息都是使用fsync -- 它有可能只是保存到缓存中，并不一定会写到硬盘中。
+            4 公平调度
+                RabbitMQ只管分发进入队列的消息，不会关心有多少消费者没有作出响应。使用basic_qos方法，设置perfetch_count=1
+                    channel.basic_qos(perfetch_count=1)
+                告诉RabbitMQ，在同一时刻，不要发送超过1条消息给一个工作者worker,直到它已经处理了上一条消息并且作出了响应。
+
+    交换机：
+        发布/订阅：分发一个消息给多个消费者。这种模式称为发布/订阅
+        
+        RabbitMQ消息模型的核心理念：发布者是将消费直接发送给交换机，由交换机来决定消费是发送到哪个队列，或者是忽略消息。
+            发布者只需要把消息发送给一个交换机，交换机负责从发布者方接收消息，把消息推送到队列
+        交换机通过交换机类型来设定，如何处理它接收到的消息，推送到指定队列还是多个队列或者忽略消息
+        RabbitMQ由四种内置交换机类型：直连交换机-direct 主题交换机-topic 头交换机-headers 扇形交换机-fanout（广播）
+        
+    匿名交换机：
+        RabbitMQ提供了一种直接向Queue发送消息的快捷方式：直接使用未命名的exchange,不用绑定routing_key，直接用它指定队列名
+            代码中使用命名未空字符串(exchange="")表示默认的交换机(direct模式)，消息将会根据指定的routing_key分发到指定
+            的队列。也可以指定具体交换机
+    临时队列：
+        连接RabbitMQ服务器时，可以手动创建一个随机的队列名，或者服务器帮我们选择一个随机的队列名(通过result.method.queue)
+        获得已经生成的随机队列名。当与消费者断开连接的时候，这个队列应当被立即删除,exclusive标识符即可达到此目的
+            channel.queue_declare(exclusive=True)    
+    绑定：
+        告诉交换机发送消息给指定的队列，交换机和队列之间的联系即是绑定
+            channel.queue_bind(exchange='logs', queue=result.method.queue)
+
+    处理连接：
+        生产者：
+            1 创建连接 2 创建交换机 3 发送消息(扇形交换机)
+        消费者：    
+            1 创建连接和通道 2 创建交换机(与生产者交换机对应) 3 创建临时队列(每个消费者都要创建的独立队列，用于接收所有消息)
+            4 创建绑定(将交换机与临时队列绑定) 5 在指定交换机接收消息并处理
+    
+    路由：
+        路由键的工作原理：每个接收端的消息队列在绑定交换机的时候，可以设定响应的路由键
+            发送端通过交换机发送信息时，可以指明路由键，交换机会根据路由键把消息发送到相应的消息队列，这样接收到就能接收到消息了
+        
+        绑定： 绑定是指交换机和队列的关系：简单理解为：这个队列对这个交换机的消息感兴趣
+              绑定的时候可以带上一个额外的routing_key参数。叫做绑定键, 绑定键的意义取决于交换机的类型
+                channel.queue_bind(exchage=exchange_name, queue=queue_name, routing_key='black')
+    
+    直连交换机和多个绑定：
+        直连交换机的路由算法很简单--交换机将会对绑定键(binding key)和路由键(routing key)进行精确匹配，从而确定消息该
+            分发到哪个队列。
+        发送端：将消息发送到交换机，设置路由键  接收端：生成临时队列，绑定交换机，设置路由键
+        
+        例子：直连交换机X和两个队列进行绑定。第一个队列使用orange作为绑定键，第二个队列有两个绑定，一个使用black作为绑定键，
+                另外一个使用green。当路由键为orange的消息发布到交换机，就会被路由到队列Q1.路由键为black或者green的消息就会
+                路由到Q2。其他的所有消息都将会被丢弃。
+        多个队列使用相同绑定键也是合法的。这种情况下，直连交换机和扇形交换机的行为一样，会将消息广播到所有匹配的队列。
+
+        代码流程：
+            生产者：
+                1 创建连接和通道 2 创建交换机(直连交换机) 3 发送消息到指定交换机，并将消息中指定routing_key
+                    channel.basic_publish(exchange='direct_logs', routing_key=severity, body=message)
+            消费者：
+                1 创建连接和通道 2 创建交换机(直连交换机) 3 创建匿名队列(每个消费者都要创建的独立队列，用于接收路由后消息)
+                4 创建绑定(生成临时队列，绑定到交换机，设置路由键，匹配路由发送消息到指定的队列)
+                5 在指定交换机处理消息
+    
+    主题交换机：
+        1 发送到主题交换机(topic exchange)的消息不可以携带随意什么样子的路由键(routing_key)，它的路由键必须是一个由.分割
+        开的词语列表。词语的个数可以随意，但不要超过255字节
+        2 绑定键也必须拥有同样的格式。主题交换机背后的逻辑跟直连交换机很相似--一个携带着特定路由键的消息会被主题交换机投递给
+            绑定键与之想匹配的队列。但是它的绑定键和路由键有两个特殊应用方式：
+                "*"(星号)用来表示一个单词(必须出现的)  "#"(井号)用来表示任意数量（零个或者多个）单词
+        3 当一个队列的绑定键为‘#’(井号)的时候，这个队列将会无视消息的路由键，接收所有的消息
+          当*(星号)和#（井号）这两个特殊字符都未在绑定键中出现的时候，此时主题交换机就拥有的直；连交换机的行为
+
+       大体流程：
+            生产者：
+                1 创建连接和通道 2 创建交换机(主题交换机) 3 发送消息到指定交换机，并将消息中指定routing_key(注意key的规则)
+            消费者：
+                1 创建连接和通道 2 创建交换机(主题交换机) 3 创建匿名队列(每个消费者都要创建的独立队列，用于接收路由后消息)
+                4 创建绑定(通过路由键绑定交换机队列关系，确定队列处理交换机中的哪些消息，注意路由键的正则规则)
+                5 在指定交换机处理消息
+
+
+---------------------------------------------------------------------------------------------------------------------
+6月16日 - 6月18日：
+    计划：每天进步一点点
+        
+    wsgi和AMPQ部分要快速重新学一遍，之前学的不好;所以学习更重要的是保证质量，在质量的基础上，在想办法提高效率
+    wsgi学习过程中遇到的库：
+        wsgiref: python的一个wsgi库，实现了wsgi规范的模块。提供了操纵WSGI环境变量和response头的工具，并且还实现了一个WSGI服务器
+                参考（https://docs.python.org/2/library/wsgiref.html ）
+        webob: webob提供了包装后的WSGI请求（Request）环境，并辅助创建WSGI响应（Response）。具体可以参考（http://webob.org/ ）
+        延伸：什么是wsgi规范？
+
+        wsgiref作为装饰器，修饰类的方法，方法可以获得一个wsgiref封装之后的request对象，这里包含了environ;免得方法还需要传
+                environ和start_response（还不理解为什么，假定是wsgi规范吧，至于request对象里面有什么，还得要分析）
+    路由处理（对应python routes模块），routers模块用来管理url的
+        
+        案例：
+            class Router(object):
+                def __init__(self):
+                    print '__init__'
+                    self.container = None
+                    mapper = Mapper()
+                    mapper.connect('blog', '/:class_name/{action}/{id}',
+                                   condition={'method': ['GET']})
+                    mapper.redirect('/', '/servers/index/1')
+                    self.router = middleware.RoutesMiddleware(self.dispatch, mapper)
+
+                @wsgify
+                def dispatch(self, req):
+                    match = req.environ['wsgiorg.routing_args'][1]
+                    print req.environ['wsgiorg.routing_args']
+                    if not match:
+                        return 'error url: %s' % req.environ
+                    class_name = match['class_name']
+                    self.controller = globals()[class_name]()
+
+                    action = match['action']
+                    if hasattr(self.controller, action):
+                        func = getattr(self.controller, action)
+                        ret = func()
+                        return ret
+                    else:
+                        return "has no action:%s" % action
+
+                @wsgify
+                def __call__(self, req):
+                    return self.router
+            解析：
+                1 类初始化的时候，先调用__init__， __call__方法表示定义的对象可以执行，执行时使用这个方法
+                2 router是个中间件对象，里面定义了__call__方法，所以在执行return self.router时，可能执行了对应的类和方法。
+                  __call__方法，dispatch是如何获取到req的？
+                3 globals()[class_name]是什么意思？ 作者提到了一句：
+                    “dispatch”中的“getattr(self.controller, action)”使用了python的内省机制（类似设计模式中的反射），
+                    通过匹配map中的url规则自动匹配对；
+                4 wsgify 是个对象，装饰方法？这个得学习以下,python是如何用类装饰方法的？ 有兴趣可以参考wsgify
+                    另外：如果处理中触发了webob.exc异常，异常信息会入Response中？
+
+            案例：
+                class MyRequest(webob.Request):
+                    @property
+                    def is_local(self):
+                        return self.remote_addr == '127.0.0.1'
+                
+                @wsgify(RequestClass=MyRequest)
+                def myfunc(req):
+                    if req.is_local:
+                        return Response('hi!')
+                    else:
+                        raise webob.exc.HTTPForbidden
+
+                这个例子看的很牛逼的样子
+    
+            案例：
+                from routes import Mapper
+                map = Mapper()
+                map.connect('lixin', '/blog', controller='main', action='index')
+                result = map.match('/blog')
+                print result
+
+                1 创建一个mapper()路由实例对象，routes模块可以根据url提取响应的参数，如controller、action或者
+                    其他用户自定义函数
+                2 connect注册路由信息，路由名称'lixin'，路径'/blog' controller为'main', action为'index'
+                    匹配到此条路由URL的请求：交由controller类处理，请求预调用的函数index
+                3 创建好路由条目后，即可进行匹配，调用match方法，匹配路径'/blog'
+                4 输出匹配结果。匹配上之后，匹配结果是一个字典，保存的是后续调用的类和类的方法
+                    如果匹配不上的话，就会输出None    
+                
+        map.connect('/error/{action}/{id}', controller='error')
+        map.connect('/error/{action:index|lixin}/{id:\d+}', controller='error')
+        1 注册无名路由，action可以从匹配路由中获得。{}用来指定里面匹配的字段是什么， ：表示的是匹配字段的格式
+        2 我们可以省略掉None,同样可以注册一条无名路由
+        
+        conditions:用于限制进行路由匹配，比如method
+        map.connect('/usr/list', controller='user', action='list', conditions={'method': ['GET', 'HEAD']})
+            只匹配GET、HEAD请求
+            POST:新建资源  GET：查询资源 PUT:更新资源 DELETE:删除资源 HEAD:验证，包括用户身份和资源的认证
+        Requirements:
+            如果只想要匹配数字，或者匹配可选的几个条目
+                map.connect(r'/blog/{id:\d+}')
+                map.connect(r'/download/{platform:windows|linux/{filename}}')
+            \d{0-9}、+{匹配前一个字符一次或多次}、| 正则表达式知识
+            可以改写成:
+                map.connect(r'/blog/{id}', requirements={'id':r'\d+'})
+                map.connect(r'/blog/{platfrom}/{filename}', requirements={'platform':r'windows|linux'})
+        Format extensions
+            map.connect('/entries/{id}/{.format}', controller='main', action='index')
+
+        Routes Resource:
+            map.resource(member_name, collection_name) 两个参数，一个指定单数，为member路由名字；
+                另一个指定复数,为controller路由名字
+            
+             map.resource("message","messages",controller=a) 等同于以下匹配条件：
+             map.connect('/messages',controller=a,action='index',conditions={'method':['GET']})
+             map.connect('/messages',controller=a,action='create',conditions={'method':['POST']})
+             map.connect('/messages/{id}',controller=a,action='show',conditions={'method':['GET']})
+             map.connect('/messages/{id}',controller=a,action='update',conditions={'method':['PUT']})
+             map.connect('/messages/{id}',controller=a,action='delete',conditions={'method':['DELETE']})
+              
+            Resource这部分还没有学习完善
+
+    RoutesMiddleware
+        RoutesMiddleware类里面实现了__call__函数，所以实例对象调用的时候，就会调用__call__方法，实现的操作是
+        map调用match通过前面定义的匹配规则匹配URL，并设置WSGI环境变量
+            environ['wsgiorg.routing_args'] = ((url, match))
+            environ['routes.route'] = route
+            environ['routes.url'] = url
+
+            route为匹配到的路由，routes.route.Route object
+            url为一个URLGenerator对象，routes.util.URLGenerator object
+            match为匹配所有到的条目
+            app为一个RoutesMiddleware对象，内部重载__call__(def __call__(self, environ, start_response))
+                仍为一个wsgi应用
+
+        wsgi_app为一个wsgi程序，RoutesMiddleware将环境变量(environ)设置好之后，就会调用wsgi_app进行后续的处理
+                后续的处理也要通过环境变量，先得到匹配的结果。如果匹配为空的话，就要进行异常处理。
+    
+    routes相关资料：https://routes.readthedocs.io/en/latest/modules/mapper.html
+
+        
+    PasteDeploy:用于定制WSGI服务
+        PasteDeploy定义的几类部件：
+            app: WSGI服务的核心部分，用户实现WSGI服务的主要逻辑
+                app是一个callable object,接收的参数(environ, start_response),这是paste系统交给application的，符合
+                WSGI规范的参数。app需要完成的任务就是响应envrion中的请求，准备好响应头和消息体，然后交给start_response处理。
+                并返回响应消息体。
+            filter(过滤器):一般用于一些准备性的工作，例如验证用户身份、准备服务器环境等。在一个filter执行完之后，可以直接返回，
+                也可以交给下一个filter或者app继续执行。
+                filter是一个callable object,其唯一参数是(app),这是WSGI的application对象，filter需要完成的工作是
+                将application包装成另一个application("过滤")，并返回这个包装后的application。
+        pipeline(管道):由若干个filter和1个app组成。通过pipeline,可以很容易定制WSGI服务。
+        composite(复合体):用于实现复杂的应用程序，可以进行分支选择。例如：根据不同的URL调用不同的处理程序
+
+        app_factory是一个callable object,其接收的参数是一些关于application的配置信息:(global_conf, **kwargs)
+        app:xxx section中定义的一系列key-value对。app_factory返回值是一个application对象
+        
+        filter_factory是一个callable object，其接收的参数是一系列关于filter的配置信息:(global_conf, **kwargs)
+        global_conf是载ini文件中default section中定义的一系列key-value,而**kwargs，即一些本地配置，是载ini文件中
+        
+        filter:xxx section中定义的一系列key-value对。filter_factory返回一个filter对象
+                    
+
+        
+---------------------------------------------------------------------------------------------------------------------
+未完计划：
+6月8日
+下午：根据简历，复习openstack neutron, opv网络和存储部分, kvm原理, 内核协议栈
+晚上：重点是python tcpdump; python重点 进程、线程和协程；http和RestAPI相关；装饰器、yield
+6月9日
+下午：每天进步一点点 openstack组件研究 所有博客   
+    现在的状态特别不好，上午被打击之后，下午就如同万念俱灰一样；一点斗志都没有了，包括周末的状态也是。
+    长期以来好像都是这个样子，这也是导致目前这种处境，这么被动的原因
+6月12日：
+上午：状态很不好，一直在想着金山的事情，精力没办法集中起来，还是太脆弱，真的一点办法都没有。把赌注都压在这上了。
+     怎么办?没什么办法，最近总是拉着别人聊天，给别人造成不小的困扰。把心里想的写出来，希望能减少一点压力吧。
+     今天又麻烦文龙给问一下情况，希望下午有信吧。拿到offer之后，得好好谢谢老袁。公司这边把防火墙部门卖给中科神威了，
+     估计又要走一大批的人了。希望一切顺利。
+下午：每天进步一点点 openstack组件研究
+    未执行，原因：cloudman网络内容还是较多了，而且精力却是不集中；cloudman关于openstack部署相关的东西，还是要仔细学的；
+           晚上学习python和eventlet，切记。    
+晚上：python和eventlet未学习，原因：懒
+

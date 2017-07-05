@@ -1,0 +1,89 @@
+
+devstack学习:
+    1 devstack should be run as a non-root user with sudo enabled，quickly create a separate
+        stack user to run DevStack with
+        sudo useradd -s /bin/bash -d /opt/stack -m stack
+
+        echo "stack ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/stack
+        sudo su - stack
+
+    2 download devstack
+      git clone https://git.openstack.org/openstack-dev/devstack
+      cd devstack
+
+    3 create a local.conf file
+        [[local|localrc]]
+
+    4 start the install
+        ./stack.sh
+
+网上找到的，关于devstack的流程：
+ SHIHUC的博客 openstack : devstack之stack.sh分析
+        1. 参数扩展（ParameterExpansion）
+            ${parameter:-word} 　　　使用默认值
+            ${parameter:=word} 　　设置默认值
+            ${parameter:?word}　　 设置错误提示信息
+            ${parameter:+word}　　 替换已设置的信息
+        2. set设置shell变量
+        3. bash版本 要求bash的版本必须是4.2或者更新
+        4. devstack执行用户非root
+        5. 参数设置
+            全局的：
+                首先检查devstack目录下是否有localrc文件，若有用之，若没有检查local.conf文件并提取当中的localrc
+            段（section），并生成.localrc.auto文件。然后，将devstack目录下stackrc中的参数source到环境当中。
+            最后做OS检查，开源社区目前只做了几种系统的测试，比如centos7,ubuntu14等，若用户的系统不是列出的系统，
+            则可以在local.conf中设置FORCE=yes去尝试安装devstack，我试过，失败的概率非常大。。。
+           
+            局部的：主要是通过export将proxy引入到环境，另外，将“-”开头的services从全局打开的服务列表中去除。
+        6 sudoers设置
+            因为devstack运行在非root用户下，某些指令需要root权限。所以需要做sudo检查/安装以及相关的sudoers的配置。
+        7 OS系统依赖设置
+        8 配置目标目录
+            devstack运行的默认DEST路径是/opt/stack。为该目录创建需要的子目录。比如data，logs，status以及一些需要安装的
+            project对应的目录（cinder，nova，neutron。。。）等。并为新建的目录设置属主。
+        9 设置hostname
+            主要是因为类似rabbitmq等服务需要解析hostname，所以，必须在/etc/hosts下面设置主机名。
+        10 设置log及trap
+            log主要是执行stack.sh的时候的输出信息，trap则涉及到error发生后该如何处理，另外一类trap就是用户执行了exit
+            这类事件devstack该如何响应。
+        11 配置projects
+            
+
+shell相关学习：
+    curl命令与应用
+
+python相关学习：
+
+    __call__ 这个是python类的内置方法，详细资料可以查看python核心编程或者 python官方文档
+    list, set, dictory使用， 字符串打印和format使用
+    logging与日志
+    pdb
+
+什么是中间件(middleware)
+
+--------------------------------------------------------------------------------------
+初级：熟练使用命令、熟悉Shell编程、能配置简单的服务，清楚各类服务相关的配置文件的位置，
+能看懂并可修改系统提供的配置脚本（/etc/*.*）
+推荐书籍：
+《鸟哥的私房菜基础篇、高级篇》
+《Advanced Bash Shell》
+
+中级：熟悉TCP/IP原理、OS原理、熟练使用C语言、Linux系统编程、网络编程。
+推荐书籍：
+《The C Programming Language》
+《Unix环境高级编程》
+《Linux程序设计》
+《TCP/IP协议详解卷一》
+《Unix网络高级编程》
+
+高级：
+《Linux Device Driver》
+《深入理解Linux内核》
+《深入理解计算机系统》
+《深入理解LINUX网络内幕》
+
+gnu: m4,automake,autoconfig,binutils,gcc, Makefile, gdb, grep, sed, awk, ld
+
+服务的配置: squid,apache,natd,named,ftpd,sshd,xinetd, crond, atd, lpd,telnetd
+文档：LaTeX, ConTeXt 
+

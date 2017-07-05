@@ -1,0 +1,145 @@
+新的一周，新的计划和进展；上两周都是零零碎碎的，希望这一周效果能好一些；不断进步嘛。这周的重点依旧是python, openstack和nova。
+其实可以关注一下libvirt等虚拟化部分，但不要投入时间太多；如果太枯燥也可以关注一下鸟哥的基础，视情况而定吧。
+
+
+2017-6-19
+    
+NetworkRequest和NetworkRequestList继承nova.object->base中的部分对象
+
+
+ServerController:
+    create:
+        create_extension_manager.map(self._create_extension_point, server_dict, create_kwargs, body)
+        -> create_extension_manager是一个stevedore.enabled.EnabledExtensionManager对象，就是加载插件的对象
+            加载了set.up中的nova.api.v3.extensions.server.create中的对象
+           map是所有插件对象执行_create_extension_point方法：(server_create)
+            
+
+        ------------------------------
+        compute_api.create：
+            compute_api = compute.API(skip_policy_check=True)
+                        -> nova.compute.api.API
+        ------------------------------
+        nova.compute.api.API.create:
+            [inst_type, image_uuid, display_name, display_description, metadata, admin_password, 
+                requested_networks, check_server_group_quota, **create_kwargs 
+                (有参数：access_ips， availability_zone， block_device_mapping， block_device_mapping_v1，
+                    config_drive， disk_config， keypairs_create， multiple_create， personality， scheduler_hints，
+                    security_groups， user_data)]
+            
+                    
+                    -------------------------------
+                    问题：
+                        nova.compute.api.py: check_policy是什么意思? nova.policy.enforce呢？
+                    -------------------------------
+            --> _create_instance
+                
+                --> _validate_and_build_base_options 创建bast_options(虚拟机的基础配置，包括vcpu、memory等信息)
+                --> _provision_instances 创建instances的数据库
+                --> compute_task_api.build_instances 执行创建虚拟机操作
+                        --------------------------------------------------
+                          compute_task_api对象是conductor.ComputeTaskAPI()
+                                               --> conductor_api.ComputeTaskAPI() 
+                        --------------------------------------------------
+                    --> ComputeTaskAPI.build_instances
+                            [conductor_compute_rpcapi = rpcapi.ComputeTaskAPI()]
+                        --> conductor_compute_rpcapi.build_instances
+                            --> 向conductor发送call rpc请求，执行build_instances操作
+                   
+
+     
+
+ComputeTaskManager.build_instances
+    
+    --------------------------------------
+    notifier = rpc.get_notifier(self.service_name, self.host)
+        notifier是什么原理？
+    --------------------------------------
+
+    
+Compute服务：
+ComputeManager:
+    --> build_and_run_instance          这里有一个utils.spawn_n,对应eventlet.spawn_n
+        --> _do_build_and_run_instance  
+            --> _build_and_run_instance
+                --> _notify_about_instance_usage(context, instance, 'create.start', )
+                --> _build_resources
+                    --> _build_networks_for_instance 创建网络相关
+                        -------------------------------------
+                            NetworkInfoAsyncWrapper中__init__ 流程是什么意思？
+                                functools.partial(self._sync_wrapper, fn)
+                        -------------------------------------
+                    --> _default_block_device_names
+
+                --> driver.spawn(context, instance, image,
+                                      injected_files, admin_password,
+                                      network_info=network_info,
+                                      block_device_info=block_device_info)
+                    --> driver: 对应的 nova/virt/libvirt/driver.py: LibvirtDriver
+                        --> LibvirtDriver.spawn:
+                            --> _create_image
+                            --> _get_guest_xml
+                            --> _create_domain_and_network
+
+                --> _notify_about_instance_usage(context, instance, 'create.end', )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
